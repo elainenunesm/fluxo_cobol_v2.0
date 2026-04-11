@@ -2109,28 +2109,63 @@ function _simExecuteSql(sqlLabel) {
   if (updM) {
     var tblName3 = updM[1];
     var tbl3 = _simDb2Tables[tblName3];
-    if (!tbl3) { _simSetVarInternal('SQLCODE', '-204'); _simLog('\u23cb SQL UPDATE: tabela ' + tblName3 + ' não cadastrada (SQLCODE=-204)', 'sim-log-error'); return; }
+    if (!tbl3) { _simSetVarInternal('SQLCODE', '-204'); _simLog('\u23cb SQL UPDATE: tabela ' + tblName3 + ' não cadastrada (SQLCODE=-204)', 'sim-log-error'); _simRefreshVarsPanel(); return; }
     var setPart  = updM[2];
     var whereUpd = (updM[3] || '').trim();
+
+    // ── Resolve e valida o SET ───────────────────────────────────
+    var updErrors = [];
+    var setAssigns = [];
+    setPart.split(',').forEach(function(sa) {
+      var sr = sa.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=\s*(?::([A-Z][A-Z0-9-]*)|'([^']*)'|([-\d.]+)|(CURRENT[_ ](?:TIMESTAMP|DATE|TIME|SCHEMA|USER|SERVER)|USER))/i);
+      if (!sr) return;
+      var sc = sr[1];
+      if (sr[2]) {
+        var vn3 = sr[2].toUpperCase();
+        if (_simVars[vn3] === undefined) {
+          updErrors.push('\u23cb SQL UPDATE ' + tblName3 + ': variável :' + vn3 + ' não declarada em WS → SET ' + sc + ' (SQLCODE=-305)');
+        } else {
+          setAssigns.push({ col: sc, val: String(_simVars[vn3]) });
+        }
+      } else if (sr[3] !== undefined) { setAssigns.push({ col: sc, val: sr[3] }); }
+      else if (sr[4] !== undefined)   { setAssigns.push({ col: sc, val: sr[4] }); }
+      else if (sr[5])                 { setAssigns.push({ col: sc, val: _simResolveSqlSpecial(sr[5].toUpperCase()) || sr[5] }); }
+    });
+
+    // ── Valida variáveis host no WHERE ───────────────────────────
+    var whereHvs = whereUpd.match(/:([A-Z][A-Z0-9-]*)/gi) || [];
+    whereHvs.forEach(function(hv) {
+      var vn3w = hv.replace(/^:/, '').toUpperCase();
+      if (_simVars[vn3w] === undefined) {
+        updErrors.push('\u23cb SQL UPDATE ' + tblName3 + ': variável :' + vn3w + ' não declarada em WS → WHERE (SQLCODE=-305)');
+      }
+    });
+
+    if (updErrors.length > 0) {
+      _simSetVarInternal('SQLCODE', '-305');
+      updErrors.forEach(function(m) { _simLog(m, 'sim-log-error'); });
+      _simRefreshVarsPanel();
+      return;
+    }
+
+    // ── Aplica o UPDATE linha a linha ────────────────────────────
     var updCount = 0;
     tbl3.rows.forEach(function(row, ri) {
       if (!_simDb2EvalWhere(row, whereUpd)) return;
-      setPart.split(',').forEach(function(sa) {
-        var sr = sa.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=\s*(?::([A-Z][A-Z0-9-]*)|'([^']*)'|([-\d.]+)|(CURRENT[_ ](?:TIMESTAMP|DATE|TIME|SCHEMA|USER|SERVER)|USER))/i);
-        if (!sr) return;
-        var sc = sr[1];
-        var sv;
-        if (sr[2])                  { sv = String(_simVars[sr[2].toUpperCase()] !== undefined ? _simVars[sr[2].toUpperCase()] : ''); }
-        else if (sr[3] !== undefined){ sv = sr[3]; }
-        else if (sr[4] !== undefined){ sv = sr[4]; }
-        else if (sr[5])             { sv = _simResolveSqlSpecial(sr[5].toUpperCase()) || sr[5]; }
-        else                        { sv = ''; }
-        tbl3.rows[ri][sc] = sv;
-      });
+      setAssigns.forEach(function(a) { tbl3.rows[ri][a.col] = a.val; });
       updCount++;
+      setAssigns.forEach(function(a) {
+        _simLog('  \u21b3 [linha ' + (ri + 1) + '] ' + a.col + ' = [' + a.val + ']', 'sim-log-file-var');
+      });
     });
+
+    // SQLCODE=0 independente de quantas linhas (comportamento DB2 searched UPDATE)
     _simSetVarInternal('SQLCODE', '0');
-    _simLog('\u23cb SQL UPDATE ' + tblName3 + ': ' + updCount + ' linha(s) atualizada(s) (SQLCODE=0)', 'sim-log-info');
+    if (updCount === 0) {
+      _simLog('\u23cb SQL UPDATE ' + tblName3 + ': nenhuma linha correspondeu ao WHERE — 0 linhas afetadas (SQLCODE=0)', 'sim-log-warn');
+    } else {
+      _simLog('\u23cb SQL UPDATE ' + tblName3 + ': ' + updCount + ' linha(s) atualizada(s) (SQLCODE=0)', 'sim-log-info');
+    }
     _simRefreshVarsPanel();
     _simRefreshDb2Panel();
     return;
@@ -2141,13 +2176,48 @@ function _simExecuteSql(sqlLabel) {
   if (delM) {
     var tblName4 = delM[1];
     var tbl4 = _simDb2Tables[tblName4];
-    if (!tbl4) { _simSetVarInternal('SQLCODE', '-204'); _simLog('\u23cb SQL DELETE: tabela ' + tblName4 + ' não cadastrada (SQLCODE=-204)', 'sim-log-error'); return; }
+    if (!tbl4) { _simSetVarInternal('SQLCODE', '-204'); _simLog('\u23cb SQL DELETE: tabela ' + tblName4 + ' não cadastrada (SQLCODE=-204)', 'sim-log-error'); _simRefreshVarsPanel(); return; }
     var whereDel = (delM[2] || '').trim();
-    var before4  = tbl4.rows.length;
-    tbl4.rows = tbl4.rows.filter(function(row){ return !_simDb2EvalWhere(row, whereDel); });
-    var deleted = before4 - tbl4.rows.length;
+
+    // ── Valida variáveis host no WHERE ───────────────────────────
+    var delErrors = [];
+    var delWhereHvs = whereDel.match(/:([A-Z][A-Z0-9-]*)/gi) || [];
+    delWhereHvs.forEach(function(hv) {
+      var vn4 = hv.replace(/^:/, '').toUpperCase();
+      if (_simVars[vn4] === undefined) {
+        delErrors.push('\u23cb SQL DELETE ' + tblName4 + ': variável :' + vn4 + ' não declarada em WS → WHERE (SQLCODE=-305)');
+      }
+    });
+
+    if (delErrors.length > 0) {
+      _simSetVarInternal('SQLCODE', '-305');
+      delErrors.forEach(function(m) { _simLog(m, 'sim-log-error'); });
+      _simRefreshVarsPanel();
+      return;
+    }
+
+    // ── Executa o DELETE e loga linhas removidas ─────────────────
+    var before4 = tbl4.rows.length;
+    var deleted4 = [];
+    tbl4.rows = tbl4.rows.filter(function(row, ri) {
+      if (!_simDb2EvalWhere(row, whereDel)) return true; // mantém
+      deleted4.push({ idx: ri + 1, row: row });
+      return false; // remove
+    });
+    var deletedCount = before4 - tbl4.rows.length;
+
+    // SQLCODE=0 mesmo com 0 linhas (comportamento DB2 searched DELETE)
     _simSetVarInternal('SQLCODE', '0');
-    _simLog('\u23cb SQL DELETE ' + tblName4 + ': ' + deleted + ' linha(s) removida(s) (SQLCODE=0)', 'sim-log-info');
+    if (deletedCount === 0) {
+      _simLog('\u23cb SQL DELETE ' + tblName4 + ': nenhuma linha correspondeu ao WHERE — 0 linhas removidas (SQLCODE=0)', 'sim-log-warn');
+    } else {
+      _simLog('\u23cb SQL DELETE ' + tblName4 + ': ' + deletedCount + ' linha(s) removida(s) (SQLCODE=0)', 'sim-log-info');
+      deleted4.forEach(function(d) {
+        var cols = Object.keys(d.row);
+        var summary = cols.map(function(c){ return c + '=[' + d.row[c] + ']'; }).join('  ');
+        _simLog('  \u2715 [linha ' + d.idx + '] ' + summary, 'sim-log-file-var');
+      });
+    }
     _simRefreshVarsPanel();
     _simRefreshDb2Panel();
     return;
