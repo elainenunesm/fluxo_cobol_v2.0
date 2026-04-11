@@ -4,8 +4,9 @@
 
 const BOOK_COLORS = ['#1a73e8','#0a7a5e','#6a1b9a','#e65100','#c62828','#0097a7','#558b2f','#ad1457','#37474f'];
 
-const _BK_MAX_ROWS     = 10000; // limite máximo de registros importados
-const _BK_IMPORT_CHUNK = 500;   // linhas por tick (mantém UI responsiva)
+const _BK_MAX_ROWS     = 500000; // máximo de registros em memória
+const _BK_IMPORT_CHUNK = 2000;   // linhas por tick (mantém UI responsiva)
+const _BK_STREAM_BYTES = 4 * 1024 * 1024; // 4 MB por chunk de leitura
 
 let _bkBooks    = [];   // [{id, name, color, src, layout}]
 let _bkActiveId = null;
@@ -792,9 +793,15 @@ function bkDataGetRows() {
 }
 
 function bkDataDecodeOneLine(raw, book, variant) {
-  const cols = bkDataGetCols(book, variant || null);
-  const fields = {};
-  cols.forEach(f => { fields[f.name] = (raw || '').substring(f.offset, f.offset + f.size); });
+  const cols    = bkDataGetCols(book, variant || null);
+  // Padeia a linha com espaços até o tamanho do registro para que campos
+  // posicionais no final da linha não fiquem vazios quando o arquivo
+  // teve seus espaços finais removidos por algum editor.
+  const recLen  = book.layout.filter(f => !f.isGroup)
+                    .reduce((m, f) => Math.max(m, f.offset + f.size), 0);
+  const padded  = (raw || '').padEnd(Math.max(recLen, 1), ' ');
+  const fields  = {};
+  cols.forEach(f => { fields[f.name] = padded.substring(f.offset, f.offset + f.size); });
   return fields;
 }
 
@@ -865,7 +872,16 @@ function bkDataAutoVariant(raw, book) {
       if (!activeConds.length) continue;
       // AND: todas as condições devem bater
       const allMatch = activeConds.every(c => {
-        const kf = book.layout.find(f => f.name === c.keyField && !f.isGroup);
+        // Busca o campo preferindo o campo do próprio layout do candidato:
+        // - base (candidate === target): prefere campos sem redefGroup
+        // - variante (candidate !== target): prefere campos com redefGroup === candidate
+        // Isso evita que campos com nomes duplicados entre base e variantes
+        // sejam resolvidos com o offset errado (ex: TIPO-RE2 no base em offset 12
+        // vs. TIPO-RE2 na variante em offset 0).
+        const kf = book.layout.find(f =>
+            f.name === c.keyField && !f.isGroup &&
+            (candidate !== target ? f.redefGroup === candidate : !f.redefGroup)
+          ) || book.layout.find(f => f.name === c.keyField && !f.isGroup);
         if (!kf) return false;
         const keyVal = (raw || '').substring(kf.offset, kf.offset + kf.size).trim();
         return keyVal === c.value.trim();
@@ -1042,14 +1058,16 @@ function _bkRecalcAllVariants(book) {
   if (!book) return;
   const rows = _bkDataStore[book.id];
   if (!rows || !rows.length) return;
-  let changed = false;
   rows.forEach(row => {
-    const newVariant = row._raw
-      ? (bkDataAutoVariant(row._raw, book) || bkDataAutoVariantFromFields(row.fields, book))
-      : bkDataAutoVariantFromFields(row.fields, book);
-    if (newVariant !== row.variant) { row.variant = newVariant; changed = true; }
+    const newVariant = row._raw != null
+      ? bkDataAutoVariant(row._raw, book)
+      : bkDataAutoVariantFromFields(row.fields || {}, book);
+    if (newVariant !== row.variant) {
+      row.variant = newVariant;
+      row.fields  = null; // invalida cache lazy — será re-decodificado na próxima exportação/leitura
+    }
   });
-  if (changed) _bkDGRender(book);
+  _bkDGRender(book); // sempre re-renderiza (regras de chave mudaram)
 }
 
 // ---- Grade de dados ----
@@ -1138,6 +1156,16 @@ function _bkDGRender(book) {
   // Alias local para manter o uso abaixo
   function pagerHTML() { return ''; }  // removido do interior do grid-wrap
 
+  // Comprimento total do registro para leitura posicional do _raw
+  const recLen = book.layout.filter(f => !f.isGroup)
+                   .reduce((m, f) => Math.max(m, f.offset + f.size), 0);
+  // Lê valor de uma célula pelo offset real do campo — evita sobrescrever por nomes duplicados
+  function _cv(row, f) {
+    if (row._raw != null) return (row._raw).padEnd(recLen, ' ').substring(f.offset, f.offset + f.size);
+    const flds = row.fields || {};
+    return flds[f.name] !== undefined ? flds[f.name] : '';
+  }
+
   if (_bkDGViewH) {
     // ========== MODO HORIZONTAL: blocos consecutivos por variante (só página atual) ==========
     // Reconstrói blocos usando apenas os índices da página
@@ -1177,9 +1205,8 @@ function _bkDGRender(book) {
         }
         block.cols.forEach(f => {
           const rc  = f.redefGroup ? ' bk-dg-td-redef' : '';
-          const val = (row.fields[f.name] !== undefined ? row.fields[f.name] : '')
-                        .replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
-          html += '<td class="bk-dg-td' + rc + '"><input class="bk-dg-input" data-row="' + idx + '" data-field="' + f.name + '" value="' + val + '" oninput="bkDataSetCell(this)"></td>';
+          const val = _cv(row, f).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+          html += '<td class="bk-dg-td' + rc + '"><input class="bk-dg-input" data-row="' + idx + '" data-field="' + f.name + '" data-offset="' + f.offset + '" data-size="' + f.size + '" value="' + val + '" oninput="bkDataSetCell(this)"></td>';
         });
         html += '<td class="bk-dg-td bk-dg-act"><button class="bk-dg-del-h" onclick="bkDataDeleteRow(' + idx + ')">&#10005;</button></td>';
         html += '</tr>';
@@ -1212,12 +1239,11 @@ function _bkDGRender(book) {
       html += '<table class="bk-dg-card-body">';
       rowCols.forEach(f => {
         const isRedef = !!f.redefGroup;
-        const val = (row.fields[f.name] !== undefined ? row.fields[f.name] : '')
-                      .replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+        const val = _cv(row, f).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
         const tip = 'PIC: ' + (f.pic || '') + ' | Tam: ' + f.size + ' | Pos: ' + (f.offset + 1) + '-' + (f.offset + f.size);
         html += '<tr class="bk-dg-field-row">';
         html += '<td class="bk-dg-field-name' + (isRedef ? ' redef' : '') + '" title="' + tip + '">' + f.name + '</td>';
-        html += '<td class="bk-dg-field-val"><input class="bk-dg-input" data-row="' + idx + '" data-field="' + f.name + '" value="' + val + '" oninput="bkDataSetCell(this)"></td>';
+        html += '<td class="bk-dg-field-val"><input class="bk-dg-input" data-row="' + idx + '" data-field="' + f.name + '" data-offset="' + f.offset + '" data-size="' + f.size + '" value="' + val + '" oninput="bkDataSetCell(this)"></td>';
         html += '</tr>';
       });
       html += '</table></div>';
@@ -1248,23 +1274,37 @@ function bkDataDeleteRow(idx) {
 }
 
 function bkDataSetCell(inp) {
-  const idx   = parseInt(inp.dataset.row, 10);
-  const field = inp.dataset.field;
-  const rows  = bkDataGetRows();
+  const idx    = parseInt(inp.dataset.row, 10);
+  const field  = inp.dataset.field;
+  const offset = inp.dataset.offset !== undefined ? parseInt(inp.dataset.offset, 10) : -1;
+  const size   = inp.dataset.size   !== undefined ? parseInt(inp.dataset.size, 10)   : 0;
+  const val    = inp.value;
+  const rows   = bkDataGetRows();
   if (!rows[idx]) return;
-  rows[idx].fields[field] = inp.value;
+  if (!rows[idx].fields) rows[idx].fields = {}; // inicializa lazy
+  rows[idx].fields[field] = val;
+  // Atualiza o _raw posicionalmente — preserva os demais campos e resolve nomes duplicados
+  if (rows[idx]._raw != null && offset >= 0 && size > 0) {
+    const base   = rows[idx]._raw.padEnd(offset + size, ' ');
+    const padded = (val + ' '.repeat(size)).substring(0, size);
+    rows[idx]._raw = base.substring(0, offset) + padded + base.substring(offset + size);
+  }
   // Se o campo editado é chave de algum REDEFINES, re-detecta variante
   const book = bkGetActive();
   if (book) {
     const rules  = _bkDataKeyRule[book.id] || {};
     const isKey  = Object.values(rules).some(r => {
-      const rl = r.rules || (r.keyField ? [r] : []);
-      return rl.some(rr => rr.keyField === field);
+      const pv = r.perVariant || {};
+      return Object.values(pv).some(conds => (conds || []).some(c => c.keyField === field));
     });
     if (isKey) {
-      const newVariant = bkDataAutoVariantFromFields(rows[idx].fields, book);
+      const raw = rows[idx]._raw;
+      const newVariant = raw != null
+        ? bkDataAutoVariant(raw, book)
+        : bkDataAutoVariantFromFields(rows[idx].fields || {}, book);
       if (newVariant !== rows[idx].variant) {
         rows[idx].variant = newVariant;
+        rows[idx].fields  = null; // invalida cache lazy
         _bkDGRender(book);
       }
     }
@@ -1302,16 +1342,20 @@ function bkDataDecodeRawPaste() {
   const ta = document.getElementById('bk-data-raw');
   if (!ta || !ta.value.trim()) return;
   const wrap  = document.getElementById('bk-data-grid-wrap');
-  const lines = ta.value.split('\n').map(l => l.replace(/\r$/, '')).filter(l => l.trim());
+  const lines = ta.value.split('\n').map(l => l.replace(/\r$/, '')).filter(l => l.length > 0);
   ta.value = '';
   _bkDataRawVis = false;
   const bar = document.getElementById('bk-data-raw-bar');
   if (bar) bar.classList.add('hidden');
   if (!lines.length) return;
+  const recLen    = book.layout.filter(f => !f.isGroup)
+                      .reduce((m, f) => Math.max(m, f.offset + f.size), 0);
+  const recPad    = Math.max(recLen, 1);
   const total     = Math.min(lines.length, _BK_MAX_ROWS);
   const truncated = lines.length > _BK_MAX_ROWS;
   if (!_bkDataStore[book.id]) _bkDataStore[book.id] = [];
   function parseAndPush(raw) {
+    raw = raw.padEnd(recPad, ' ');
     let variant = bkDataAutoVariant(raw, book);
     const fields = bkDataDecodeOneLine(raw, book, variant);
     if (!variant && Object.keys(fields).length) variant = bkDataAutoVariantFromFields(fields, book);
@@ -1342,6 +1386,12 @@ function bkDataDecodeRawPaste() {
 }
 
 // ---- Helpers de progresso ----
+function _bkFmtBytes(b) {
+  if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+  if (b >= 1024)   return (b / 1024).toFixed(0) + ' KB';
+  return b + ' B';
+}
+
 function _bkShowProgress(wrap, done, total, label) {
   const pct = total > 0 ? Math.round(done / total * 100) : 0;
   wrap.innerHTML =
@@ -1354,6 +1404,29 @@ function _bkShowProgress(wrap, done, total, label) {
         '<div class="bk-import-progress-fill" style="width:' + pct + '%"></div>' +
       '</div>' +
     '</div>';
+}
+
+function _bkShowProgressFile(wrap, doneBytes, totalBytes, rowCount, label) {
+  const pct     = totalBytes > 0 ? Math.round(doneBytes / totalBytes * 100) : 0;
+  const doneStr = _bkFmtBytes(doneBytes) + ' / ' + _bkFmtBytes(totalBytes);
+  wrap.innerHTML =
+    '<div class="bk-import-progress">' +
+      '<div class="bk-import-progress-label">' + label + ' &mdash; ' +
+        doneStr + ' &nbsp;|&nbsp; ' + rowCount.toLocaleString('pt-BR') + ' reg. (' + pct + '%)' +
+      '</div>' +
+      '<div class="bk-import-progress-track">' +
+        '<div class="bk-import-progress-fill" style="width:' + pct + '%"></div>' +
+      '</div>' +
+    '</div>';
+}
+
+// Retorna os fields de um registro, decodificando do _raw se ainda não foram preenchidos (lazy).
+// Uso: exportações e funções que precisam do dict de campos por nome.
+function _bkRowFields(row, book) {
+  if (!row.fields || !Object.keys(row.fields).length) {
+    if (row._raw != null) row.fields = bkDataDecodeOneLine(row._raw, book, row.variant);
+  }
+  return row.fields || {};
 }
 
 function _bkInjectWarn(wrap, originalCount) {
@@ -1372,40 +1445,69 @@ function bkDataImportTxtFile(inp) {
   if (!inp.files || !inp.files.length) return;
   const book = bkGetActive();
   if (!book || !book.layout.length) { alert('Gere o layout primeiro.'); inp.value = ''; return; }
+  const file = inp.files[0];
+  inp.value = '';
   const wrap = document.getElementById('bk-data-grid-wrap');
-  const reader = new FileReader();
-  reader.onload = e => {
-    const lines = (e.target.result || '').split('\n')
-      .map(l => l.replace(/\r$/, '')).filter(l => l.trim());
-    inp.value = '';
-    if (!lines.length) return;
-    const total     = Math.min(lines.length, _BK_MAX_ROWS);
-    const truncated = lines.length > _BK_MAX_ROWS;
-    if (!_bkDataStore[book.id]) _bkDataStore[book.id] = [];
-    _bkShowProgress(wrap, 0, total, 'Importando TXT');
-    let i = 0;
-    function processChunk() {
-      const end = Math.min(i + _BK_IMPORT_CHUNK, total);
-      for (; i < end; i++) {
-        const raw = lines[i];
-        let variant = bkDataAutoVariant(raw, book);
-        const fields = bkDataDecodeOneLine(raw, book, variant);
-        if (!variant && Object.keys(fields).length) variant = bkDataAutoVariantFromFields(fields, book);
-        _bkDataStore[book.id].push({ fields, variant, _raw: raw });
+
+  const recLen   = book.layout.filter(f => !f.isGroup).reduce((m, f) => Math.max(m, f.offset + f.size), 0);
+  const recPad   = Math.max(recLen, 1);
+  const totalSz  = file.size;
+  if (!_bkDataStore[book.id]) _bkDataStore[book.id] = [];
+
+  let bytesDone = 0;
+  let rowCount  = 0;
+  let exceeded  = false;
+  let remainder = '';   // fragmento de linha incompleta ao final de cada chunk
+
+  _bkShowProgressFile(wrap, 0, totalSz, 0, 'Importando');
+
+  function readChunk() {
+    if (exceeded || bytesDone >= totalSz) { _bkFinalize(); return; }
+    const slice  = file.slice(bytesDone, bytesDone + _BK_STREAM_BYTES);
+    const reader = new FileReader();
+    reader.onload = ev => {
+      bytesDone += slice.size;
+      const text  = remainder + (ev.target.result || '');
+      const lines = text.split('\n');
+      remainder   = lines.pop() || ''; // guarda fragmento incompleto
+
+      for (const line of lines) {
+        if (exceeded) break;
+        const raw = line.replace(/\r$/, '');
+        if (!raw.length) continue;
+        if (rowCount >= _BK_MAX_ROWS) { exceeded = true; break; }
+        const padded  = raw.padEnd(recPad, ' ');
+        const variant = bkDataAutoVariant(padded, book);
+        // Não decodifica fields agora — lazy quando exportar (economiza ~50% de memória)
+        _bkDataStore[book.id].push({ _raw: padded, variant, fields: null });
+        rowCount++;
       }
-      if (i < total) {
-        _bkShowProgress(wrap, i, total, 'Importando TXT');
-        setTimeout(processChunk, 0);
-      } else {
-        _bkDGPage[book.id] = 1;
-        _bkRecalcAllVariants(book);
-        _bkDGRender(book);
-        if (truncated) _bkInjectWarn(wrap, lines.length);
+
+      _bkShowProgressFile(wrap, bytesDone, totalSz, rowCount, 'Importando');
+      setTimeout(readChunk, 0);
+    };
+    reader.onerror = () => { alert('Erro ao ler o arquivo.'); };
+    reader.readAsText(slice, 'latin1');
+  }
+
+  function _bkFinalize() {
+    // Processa remainder (última linha sem \n)
+    if (remainder.length && !exceeded && rowCount < _BK_MAX_ROWS) {
+      const raw = remainder.replace(/\r$/, '');
+      if (raw.length) {
+        const padded  = raw.padEnd(recPad, ' ');
+        const variant = bkDataAutoVariant(padded, book);
+        _bkDataStore[book.id].push({ _raw: padded, variant, fields: null });
+        rowCount++;
       }
     }
-    processChunk();
-  };
-  reader.readAsText(inp.files[0], 'latin1');
+    _bkDGPage[book.id] = 1;
+    _bkRecalcAllVariants(book);
+    _bkDGRender(book);
+    if (exceeded) _bkInjectWarn(wrap, '> ' + _BK_MAX_ROWS.toLocaleString('pt-BR'));
+  }
+
+  readChunk();
 }
 
 // ---- Import Excel / CSV ----
@@ -1658,7 +1760,8 @@ function bkDataExportCsv() {
     lines.push('# ' + (block.variant || '— padrão —'));
     lines.push(block.cols.map(f => '"' + f.name + '"').join(','));
     block.rows.forEach(idx => {
-      lines.push(block.cols.map(f => '"' + (rows[idx].fields[f.name] || '').replace(/"/g, '""') + '"').join(','));
+      const flds = _bkRowFields(rows[idx], book);
+      lines.push(block.cols.map(f => '"' + (flds[f.name] || '').replace(/"/g, '""') + '"').join(','));
     });
     lines.push('');
   });
@@ -1672,7 +1775,8 @@ function bkDataExportTxt() {
     books.forEach(book => {
       const rows = _bkDataStore[book.id] || [];
       if (!rows.length) return;
-      const lines = rows.map(row => bkDataEncodeToRaw(row.fields, book, row.variant));
+      // Se há _raw, usa diretamente (mais rápido e preserva bytes exatos)
+      const lines = rows.map(row => row._raw != null ? row._raw : bkDataEncodeToRaw(_bkRowFields(row, book), book, row.variant));
       bkDownloadBlob(lines.join('\r\n'), `${book.name}-dados.txt`, 'text/plain;charset=latin1;');
     });
   }, b => (_bkDataStore[b.id] || []).length > 0);
@@ -1737,7 +1841,8 @@ function bkDataExportXls(mode) {
       const varRows = rows.filter(r => (r.variant || null) === variant);
       let tbl = `<Row>${cols.map(c => cell(c.name, 'String', 'hdr')).join('')}</Row>\n`;
       varRows.forEach(row => {
-        tbl += `<Row>${cols.map(c => cell(row.fields[c.name] || '', 'String')).join('')}</Row>\n`;
+        const flds = _bkRowFields(row, book);
+        tbl += `<Row>${cols.map(c => cell(flds[c.name] || '', 'String')).join('')}</Row>\n`;
       });
       const sn = esc((variant || 'padrao').substring(0, 31));
       sheetsXml += `<Worksheet ss:Name="${sn}"><Table>${tbl}</Table></Worksheet>\n`;
@@ -1755,8 +1860,9 @@ function bkDataExportXls(mode) {
       tbl += `<Row>${block.cols.map(c => cell(c.name, 'String', 'hdr')).join('')}</Row>\n`;
       // Linhas de dados
       block.rows.forEach(idx => {
-        const row = rows[idx];
-        tbl += `<Row>${block.cols.map(c => cell(row.fields[c.name] || '', 'String')).join('')}</Row>\n`;
+        const row  = rows[idx];
+        const flds = _bkRowFields(row, book);
+        tbl += `<Row>${block.cols.map(c => cell(flds[c.name] || '', 'String')).join('')}</Row>\n`;
       });
       // Linha em branco separadora
       tbl += `<Row><Cell><Data ss:Type="String"></Data></Cell></Row>\n`;
@@ -1791,8 +1897,9 @@ function bkDataExportJson() {
       if (!rows.length) return;
       const out = rows.map(row => {
         const cols = bkDataVariantCols(book, row.variant || null);
+        const flds = _bkRowFields(row, book);
         const obj  = {};
-        cols.forEach(c => { obj[c.name] = row.fields[c.name] !== undefined ? row.fields[c.name] : ''; });
+        cols.forEach(c => { obj[c.name] = flds[c.name] !== undefined ? flds[c.name] : ''; });
         return obj;
       });
       bkDownloadBlob(JSON.stringify(out, null, 2), `${book.name}-dados.json`, 'application/json;charset=utf-8');
