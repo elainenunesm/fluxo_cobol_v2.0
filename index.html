@@ -1,0 +1,889 @@
+﻿<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>COBOL Flow</title>
+
+<script src="libs/cytoscape.min.js"></script>
+<script src="libs/dagre.min.js"></script>
+<script src="libs/cytoscape-dagre.js"></script>
+<script src="libs/cytoscape-svg.js"></script>
+<script src="libs/jszip.min.js"></script>
+<script src="libs/xlsx.full.min.js"></script>
+
+<link rel="stylesheet" href="css/main.css?v=20260410d">
+</head>
+
+<body>
+<div id="ide-shell">
+
+<!-- ===== BARRA DE TITULO IDE ===== -->
+<div id="ide-titlebar">
+  <div class="ide-title-left">
+    <span class="ide-app-icon">&#9672;</span>
+    <span class="ide-app-name">COBOL Flow</span>
+    <span class="ide-title-sep">&#8250;</span>
+    <span class="ide-prog-lbl">Programa:</span>
+    <span id="ide-prog-name">&#8212;</span>
+  </div>
+  <div class="ide-title-right">
+    <span class="ide-node-badge" id="ide-node-badge"></span>
+  </div>
+</div>
+
+<!-- ===== RIBBON IDE ===== -->
+<div id="ide-ribbon" class="cy-toolbar">
+
+  <!-- Grupo: Código -->
+  <div class="ribbon-group">
+    <div class="ribbon-group-btns">
+      <button class="ribbon-btn" onclick="abrirImportarTxt(this)" title="Importar arquivo .txt">
+        <span class="ribbon-btn-icon">&#128229;</span>
+        <span class="ribbon-btn-label">Importar</span>
+      </button>
+      <button class="ribbon-btn ribbon-btn-gerar" onclick="analisar()" title="Gerar diagrama de fluxo">
+        <span class="ribbon-btn-icon">&#9654;&#65039;</span>
+        <span class="ribbon-btn-label">Gerar&nbsp;Fluxo</span>
+      </button>
+      <button class="ribbon-btn ribbon-btn-execmap" onclick="execMapOpen()" title="Mapa de Execução — simulador ao lado do código">
+        <span class="ribbon-btn-icon">&#9889;</span>
+        <span class="ribbon-btn-label">Mapa de<br>Execução</span>
+      </button>
+    </div>
+    <div class="ribbon-group-name">C&#243;digo</div>
+  </div>
+
+  <div class="ribbon-sep"></div>
+
+  <!-- Grupo: Navegação -->
+  <div class="ribbon-group">
+    <div class="ribbon-group-btns">
+      <button class="ribbon-btn" onclick="zoomIn()" title="Ampliar (Zoom +)">
+        <span class="ribbon-btn-icon">&#128270;</span>
+        <span class="ribbon-btn-label">Ampliar</span>
+      </button>
+      <span class="ribbon-zoom-lvl zoom-level" id="zoom-level">100%</span>
+      <button class="ribbon-btn" onclick="zoomOut()" title="Reduzir (Zoom -)">
+        <span class="ribbon-btn-icon">&#128269;</span>
+        <span class="ribbon-btn-label">Reduzir</span>
+      </button>
+      <button class="ribbon-btn" onclick="zoomFit()" title="Ajustar diagrama &#224; tela">
+        <span class="ribbon-btn-icon">&#128207;</span>
+        <span class="ribbon-btn-label">Ajustar</span>
+      </button>
+      <button class="ribbon-btn" id="btn-inicio" onclick="irParaInicio()" title="Ir para o n&#243; de entrada" disabled>
+        <span class="ribbon-btn-icon">&#127968;</span>
+        <span class="ribbon-btn-label">In&#237;cio</span>
+      </button>
+    </div>
+    <div class="ribbon-group-name">Navega&#231;&#227;o</div>
+  </div>
+
+  <div class="ribbon-sep"></div>
+
+  <!-- Grupo: Layout -->
+  <div class="ribbon-group">
+    <div class="ribbon-group-btns">
+      <select id="layout-select" class="layout-select ribbon-select" title="Escolha a organiza&#231;&#227;o visual do fluxo">
+        <option value="tb">&#8595; Vertical (padr&#227;o)</option>
+        <option value="lr">&#8594; Horizontal</option>
+        <option value="grid">&#9783; Grade</option>
+        <option value="compact">&#8609; Compacto</option>
+      </select>
+      <button class="ribbon-btn ribbon-btn-layout" onclick="reorganizar()" title="Reorganizar sem regenerar o fluxo">
+        <span class="ribbon-btn-icon">&#128260;</span>
+        <span class="ribbon-btn-label">Reorganizar</span>
+      </button>
+    </div>
+    <div class="ribbon-group-name">Layout</div>
+  </div>
+
+  <div class="ribbon-sep"></div>
+
+  <!-- Grupo: Fluxo -->
+  <div class="ribbon-group">
+    <div class="ribbon-group-btns">
+      <select id="view-select" class="ribbon-select" title="Tipo de visão do fluxo"
+              onchange="document.getElementById('depth-select').style.display=this.value==='macro'?'none':''">
+        <option value="detail">&#128209; Detalhado</option>
+        <option value="macro">&#128200; Macro-fluxo</option>
+      </select>
+      <select id="depth-select" class="ribbon-select" title="Profundidade de expansão de parágrafos">
+        <option value="30">&#128260; Completo (inteligente)</option>
+        <option value="999">&#9889; Tudo (pode ser lento)</option>
+        <option value="6">&#128196; 6 níveis</option>
+        <option value="3">&#128196; 3 níveis</option>
+        <option value="2">&#128196; 2 níveis</option>
+        <option value="1">&#9646; 1 nível</option>
+        <option value="0">&#9632; Apenas chamadas</option>
+      </select>
+    </div>
+    <div class="ribbon-group-name">Visão</div>
+  </div>
+
+  <div class="ribbon-sep"></div>
+
+  <!-- Grupo: Documentação -->
+  <div class="ribbon-group">
+    <div class="ribbon-group-btns">
+      <div class="btn-exportar-wrap" id="export-wrap">
+        <button class="ribbon-btn ribbon-btn-export" onclick="toggleExportMenu()" title="Exportar documenta&#231;&#227;o">
+          <span class="ribbon-btn-icon">&#128228;</span>
+          <span class="ribbon-btn-label">Exportar&nbsp;&#9660;</span>
+        </button>
+        <div class="export-menu" id="export-menu">
+          <button onclick="exportarPNG();fecharExportMenu()">&#128444; Imagem PNG (diagrama)</button>
+          <button onclick="exportarSVG();fecharExportMenu()">&#9673; Imagem SVG (vetorial)</button>
+          <hr class="menu-sep">
+          <button onclick="abrirDialogExportar('html');fecharExportMenu()">&#128196; Relat&#243;rio (HTML / Word)</button>
+          <button onclick="exportarCobol();fecharExportMenu()">&#128221; Gerar Estrutura COBOL (.cbl)</button>
+          <hr class="menu-sep">
+          <button onclick="exportarSessao()" title="Salva c&#243;digo, fluxo, posi&#231;&#245;es e coment&#225;rios em JSON">&#128190; Salvar sess&#227;o (.json)</button>
+          <button onclick="document.getElementById('sessao-input').click();fecharExportMenu()" title="Restaura uma sess&#227;o salva anteriormente">&#128194; Importar sess&#227;o (.json)</button>
+        </div>
+      </div>
+      <button class="ribbon-btn btn-sessao-salvar" onclick="wsSave()" title="Salvar workspace completo (COBOL + Book + Banco de Dados)">
+        <span class="ribbon-btn-icon">&#128190;</span>
+        <span class="ribbon-btn-label">Salvar</span>
+      </button>
+      <button class="ribbon-btn btn-sessao-abrir" onclick="wsLoadTrigger()" title="Abrir workspace salvo anteriormente">
+        <span class="ribbon-btn-icon">&#128194;</span>
+        <span class="ribbon-btn-label">Abrir</span>
+      </button>
+    </div>
+    <div class="ribbon-group-name">Documenta&#231;&#227;o</div>
+  </div>
+
+  <div class="ribbon-sep"></div>
+
+  <!-- Grupo: Visual -->
+  <div class="ribbon-group">
+    <div class="ribbon-group-btns">
+      <button class="ribbon-btn ribbon-btn-comentarios" id="btn-comentarios" onclick="toggleComentarios()" title="Abrir painel de coment&#225;rios">
+        <span class="ribbon-btn-icon">&#128172;</span>
+        <span class="ribbon-btn-label">Coment&#225;rios</span>
+      </button>
+      <button class="ribbon-btn btn-tema" id="btn-tema" onclick="toggleTema()" title="Alternar tema claro/escuro">
+        <span class="ribbon-btn-icon btn-tema-icon" id="btn-tema-icon">&#127769;</span>
+        <span class="ribbon-btn-label btn-tema-label" id="btn-tema-label">Dark</span>
+      </button>
+    </div>
+    <div class="ribbon-group-name">Visual</div>
+  </div>
+
+  <div class="ribbon-sep"></div>
+
+  <!-- Grupo: Simulador -->
+  <div class="ribbon-group">
+    <div class="ribbon-group-btns">
+      <button class="ribbon-btn" id="btn-simular" onclick="simOpen()" title="Simular execu&#231;&#227;o COBOL passo a passo" style="border-color:#4f46e5;color:#4f46e5;">
+        <span class="ribbon-btn-icon">&#127381;</span>
+        <span class="ribbon-btn-label">Simular</span>
+      </button>      <button class="ribbon-btn" id="btn-relatorio" onclick="repOpenModal()" title="Relatório de Investigação" style="border-color:#0891b2;color:#0891b2;">
+        <span class="ribbon-btn-icon">&#128203;</span>
+        <span class="ribbon-btn-label">Relatório</span>
+        <span class="rep-badge"></span>
+      </button>    </div>
+    <div class="ribbon-group-name">Debug</div>
+  </div>
+
+  <div class="ribbon-sep"></div>
+
+  <!-- Grupo: Book / BD -->
+  <div class="ribbon-group">
+    <div class="ribbon-group-btns">
+      <button class="ribbon-btn ribbon-btn-book" id="btn-importar-book" onclick="bookOpenModal()" title="Importar copybook COBOL e visualizar layout de campos">
+        <span class="ribbon-btn-icon">&#128218;</span>
+        <span class="ribbon-btn-label">Importar<br>Book</span>
+      </button>
+      <button class="ribbon-btn ribbon-btn-db" id="btn-banco-dados" onclick="dbOpenModal()" title="Importar DDL ou DCLGEN e visualizar colunas e variáveis COBOL">
+        <span class="ribbon-btn-icon">&#128451;</span>
+        <span class="ribbon-btn-label">Banco de<br>Dados</span>
+      </button>
+    </div>
+    <div class="ribbon-group-name">Book / BD</div>
+  </div>
+
+
+
+</div>
+<div class="container">
+
+<div class="left" id="left-panel">
+
+<!-- ===== EDITOR COBOL ===== -->
+<div class="cobol-editor-wrap">
+
+  <!-- Abas -->
+  <div class="cobol-editor-tabs">
+    <button class="cobol-editor-tab active">CICS/COBOL</button>
+  </div>
+
+  <!-- Barra de navegação -->
+  <div class="cobol-goto-bar" id="cobol-goto-bar" onclick="toggleCblGoto(event)">
+    &#33; Ir para divis&#227;o / se&#231;&#227;o...
+    <div class="cobol-goto-menu" id="cobol-goto-menu"></div>
+  </div>
+
+  <!-- Corpo do editor -->
+  <div class="cobol-editor-body">
+    <div class="cobol-ln" id="cobol-ln"></div>
+    <div class="cobol-code">
+      <div class="cobol-hi" id="cobol-hi" aria-hidden="true"></div>
+      <textarea id="input" class="cobol-textarea" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off">
+      *-----------------------------------------------------------------
+       IDENTIFICATION DIVISION.
+      *-----------------------------------------------------------------
+       PROGRAM-ID.       CADCACGC.
+      *-----------------------------------------------------------------
+      *  OBJETIVO : Calcula o digito do CNPJ (CGC)
+      *-----------------------------------------------------------------
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-AUX PIC 9(008) VALUE ZEROES.
+       LINKAGE SECTION.
+       01  LKS-PARAMETRO.
+           05 LKS-RETORNO   PIC 9(001).
+           05 LKS-NUMERO-I  PIC X(012).
+           05 LKS-NUMERO-C  PIC 9(014).
+      *-----------------------------------------------------------------
+       PROCEDURE DIVISION USING LKS-PARAMETRO.
+      *-----------------------------------------------------------------
+           PERFORM P1000-INICIAL
+           PERFORM P2000-PRINCIPAL
+           PERFORM P4000-FINAL
+           GOBACK.
+
+      *-----------------------------------------------------------------
+       P1000-INICIAL.
+      *-----------------------------------------------------------------
+           IF LKS-NUMERO-I NOT NUMERIC
+               MOVE 1 TO LKS-RETORNO
+               GOBACK
+           ELSE
+               MOVE LKS-NUMERO-I TO WS-AUX
+           END-IF.
+
+       P1000-FIM.
+           EXIT.
+
+      *-----------------------------------------------------------------
+       P2000-PRINCIPAL.
+      *-----------------------------------------------------------------
+           MOVE 01 TO WS-AUX
+           PERFORM P3000-CALC-DIGITO THRU P3000-FIM
+           MOVE 02 TO WS-AUX
+           PERFORM P3000-CALC-DIGITO THRU P3000-FIM.
+
+       P2000-FIM.
+           EXIT.
+
+      *-----------------------------------------------------------------
+       P3000-CALC-DIGITO.
+      *-----------------------------------------------------------------
+           PERFORM UNTIL WS-AUX GREATER 12
+               COMPUTE WS-AUX = WS-AUX + 1
+           END-PERFORM
+           IF WS-AUX EQUAL 0 OR 1
+               MOVE ZEROES TO LKS-NUMERO-C
+           ELSE
+               MOVE WS-AUX TO LKS-NUMERO-C
+           END-IF.
+
+       P3000-FIM.
+           EXIT.
+
+      *-----------------------------------------------------------------
+       P4000-FINAL.
+      *-----------------------------------------------------------------
+           MOVE 0          TO LKS-RETORNO.
+           MOVE WS-AUX     TO LKS-NUMERO-C.
+
+       P4000-FIM.
+           EXIT.
+</textarea>
+    </div><!-- .cobol-code -->
+  </div><!-- .cobol-editor-body -->
+</div><!-- .cobol-editor-wrap -->
+
+<input type="file" id="file-input" accept=".txt" style="display:none" onchange="importarTxt(event)">
+<input type="file" id="sessao-input" accept="application/json,.json" style="display:none" onchange="importarSessao(event)">
+<input type="file" id="ws-load-input" accept=".json" style="display:none" onchange="wsLoadFile(event)">
+<button class="btn-importar" onclick="abrirImportarTxt(this)">&#128194; Importar .txt</button>
+<button class="btn-gerar" onclick="analisar()">Gerar Fluxo</button>
+<button class="btn-execmap" onclick="execMapOpen()" title="Mapa de Execução">&#9889; Mapa de Execução</button>
+</div>
+
+<div class="divider" id="divider"></div>
+
+<div class="right">
+<div class="ide-canvas-hdr">
+  <span class="ide-canvas-dot">&#9675;</span>
+  DIAGRAMA DE FLUXO
+  <span class="ide-canvas-hdr-info" id="ide-canvas-info"></span>
+</div>
+<!-- Barra de navegação do diagrama -->
+<div class="diag-nav-backdrop" id="diag-nav-backdrop" onclick="_fecharMenusNav()"></div>
+<div class="diag-nav-bar" id="diag-nav-bar">
+  <!-- Botão: Ir para parágrafo / seção -->
+  <div class="diag-nav-btn" id="diag-goto-bar" onclick="toggleDiagGoto(event)">
+    &#9654; Ir para par&#225;grafo / se&#231;&#227;o...
+    <div class="diag-nav-menu" id="diag-goto-menu">
+      <input class="diag-nav-filter" id="diag-goto-filter" type="text" placeholder="Filtrar..." onclick="event.stopPropagation()" oninput="_filtrarDiagGoto(this.value)">
+      <div class="diag-nav-list" id="diag-goto-list"></div>
+    </div>
+  </div>
+  <!-- Botão: Ir para execução -->
+  <div class="diag-nav-btn" id="diag-exec-bar" onclick="toggleDiagExec(event)">
+    &#9654; Ir para execu&#231;&#227;o...
+    <div class="diag-nav-menu diag-exec-menu" id="diag-exec-menu">
+      <input class="diag-nav-filter" id="diag-exec-filter" type="text" placeholder="Filtrar processo..." onclick="event.stopPropagation()" oninput="_filtrarDiagExec(this.value)">
+      <div class="exec-action-bar" id="diag-exec-action-bar">
+        <button class="exec-action-btn" onclick="event.stopPropagation();_execExpandAll(true)" title="Expandir todos os parágrafos">&#9660; Expandir tudo</button>
+        <button class="exec-action-btn" onclick="event.stopPropagation();_execExpandAll(false)" title="Recolher todos os parágrafos">&#9654; Recolher tudo</button>
+      </div>
+      <div class="diag-nav-list" id="diag-exec-list"></div>
+    </div>
+  </div>
+</div>
+<div id="cy"></div>
+
+<!-- Overlay de carregamento — exibido durante geração do fluxo -->
+<div id="cy-loading">
+  <div class="cy-loading-spinner"></div>
+  <div class="cy-loading-text">Gerando fluxo...</div>
+  <div class="cy-loading-sub" id="cy-loading-sub">Analisando o programa COBOL</div>
+  <div class="cy-loading-progress-wrap">
+    <div class="cy-loading-progress-bar" id="cy-loading-bar"></div>
+  </div>
+  <div class="cy-loading-step" id="cy-loading-step"></div>
+</div>
+
+<!-- Painel de erro � exibido quando o fluxo falha ou fica vazio -->
+<div id="cy-erro">
+  <div class="cy-erro-icon">??</div>
+  <div class="cy-erro-titulo" id="cy-erro-titulo">N&#227;o foi poss&#237;vel gerar o fluxo</div>
+  <div class="cy-erro-msg" id="cy-erro-msg"></div>
+  <div class="cy-erro-dica" id="cy-erro-dica"></div>
+  <button class="cy-erro-fechar" onclick="document.getElementById('cy-erro').classList.remove('ativo')">Fechar</button>
+</div>
+
+<div id="details-divider" class="divider-h" title="Toque para expandir detalhes"></div>
+<div id="details"><span style="color:#aaa;font-size:11px;">Clique em um nó para ver detalhes</span></div>
+</div>
+
+<!-- ===== PAINEL DE COMENT�RIOS ===== -->
+<div class="comments-divider" id="comments-divider"></div>
+<div class="comments-panel" id="comments-panel">
+
+  <!-- Cabe�alho -->
+  <div class="comments-header">
+    <span>&#128172; Coment&#225;rios</span>
+    <button onclick="toggleComentarios()" title="Fechar painel">&#10005;</button>
+  </div>
+
+  <!-- Abas -->
+  <div class="comments-tabs">
+    <button class="comments-tab active" id="tab-bloco" onclick="mudarAbaComentario('bloco')">&#128204; Bloco</button>
+    <button class="comments-tab" id="tab-geral" onclick="mudarAbaComentario('geral')">&#128196; Geral <span class="comments-tab-badge" id="comments-badge"></span></button>
+  </div>
+
+  <!-- Aba: Bloco selecionado -->
+  <div class="comments-pane active" id="pane-bloco">
+    <div class="comments-node-area">
+      <div class="comments-node-label" id="comments-node-label">Bloco: <span id="comments-node-name" style="font-style:italic;color:#bbb;">nenhum selecionado</span></div>
+      <textarea id="comments-textarea" placeholder="Digite o coment&#225;rio para este bloco... (Ctrl+Enter salva)" disabled></textarea>
+      <div class="comments-save-row">
+        <button class="btn-comment-save" id="btn-comment-save" onclick="salvarComentario()" disabled>&#10003; Salvar</button>
+        <button class="btn-comment-del"  id="btn-comment-del"  onclick="excluirComentario()" disabled title="Remover coment&#225;rio">&#128465;</button>
+        <span class="comments-saved-msg" id="comments-saved-msg">&#10003; Salvo!</span>
+      </div>
+    </div>
+    <div class="comments-current-preview" id="comments-current-preview"></div>
+  </div>
+
+  <!-- Aba: Geral (todos os coment�rios) -->
+  <div class="comments-pane" id="pane-geral">
+    <div class="comments-list" id="comments-list">
+      <div class="comments-empty">Nenhum coment&#225;rio ainda.</div>
+    </div>
+  </div>
+
+</div>
+
+</div>
+
+
+<!-- ===== BARRA DE STATUS ===== -->
+<div id="ide-statusbar">
+  <div class="ide-sb-left">
+    <span class="ide-sb-item">&#9672; COBOL Flow IDE</span>
+    <span class="ide-sb-item" id="sb-program">Nenhum programa aberto</span>
+  </div>
+  <div class="ide-sb-right">
+    <span class="ide-sb-item" id="sb-nodes">&#8212;</span>
+    <span class="ide-sb-item" id="sb-zoom">100%</span>
+    <span class="ide-sb-item">COBOL 85</span>
+  </div>
+</div>
+
+</div><!-- /ide-shell -->
+<!-- ===== BARRA DE ABAS MOBILE (oculta no desktop) ===== -->
+<div class="mobile-tab-bar" id="mobile-tab-bar">
+  <button class="mobile-tab active" id="mob-tab-code" onclick="mobTab('code')">
+    <span class="mobile-tab-icon">&#128196;</span>
+    <span class="mobile-tab-label">C&#243;digo</span>
+  </button>
+  <button class="mobile-tab" id="mob-tab-flow" onclick="mobTab('flow')">
+    <span class="mobile-tab-icon">&#128257;</span>
+    <span class="mobile-tab-label">Diagrama</span>
+  </button>
+</div>
+
+<script src="js/main.js?v=20260410c"></script>
+
+<!-- Modal opções de exportação -->
+<div class="exp-overlay" id="exp-modal" onclick="if(event.target===this)fecharDialogExportar()">
+  <div class="exp-box">
+    <h3>&#128229; Op&#231;&#245;es de Exporta&#231;&#227;o</h3>
+    <div class="exp-format-row">
+      <button class="exp-fmt-btn active" id="exp-fmt-html" onclick="_expSetFmt('html')">&#128196; HTML</button>
+      <button class="exp-fmt-btn" id="exp-fmt-word" onclick="_expSetFmt('word')">&#128196; Word (.doc)</button>
+    </div>
+    <hr class="exp-sep">
+    <div class="exp-chk-list">
+      <label class="exp-chk-item">
+        <input type="checkbox" id="exp-chk-indice" checked>
+        &#128203; &#205;ndice de Se&#231;&#245;es e Par&#225;grafos
+      </label>
+      <label class="exp-chk-item">
+        <input type="checkbox" id="exp-chk-mapa-decl" checked>
+        &#127795; Mapa de Par&#225;grafos &#8212; Declara&#231;&#227;o
+      </label>
+      <label class="exp-chk-item">
+        <input type="checkbox" id="exp-chk-mapa-exec-res" checked>
+        &#128336; Fluxo de Execu&#231;&#227;o &#8212; Resumido
+      </label>
+      <label class="exp-chk-item">
+        <input type="checkbox" id="exp-chk-mapa-exec-exp">
+        &#128269; Fluxo de Execu&#231;&#227;o &#8212; Expandido (PERFORM THRU detalhado)
+      </label>
+      <label class="exp-chk-item">
+        <input type="checkbox" id="exp-chk-coments" checked>
+        &#128204; Coment&#225;rios anotados
+      </label>
+      <label class="exp-chk-item">
+        <input type="checkbox" id="exp-chk-diagrama" checked>
+        &#128200; Diagrama de Fluxo
+      </label>
+      <label class="exp-chk-item">
+        <input type="checkbox" id="exp-chk-legenda" checked>
+        &#127912; Legenda de cores
+      </label>
+    </div>
+    <hr class="exp-sep">
+    <div class="exp-actions">
+      <button class="exp-btn-cancel" onclick="fecharDialogExportar()">Cancelar</button>
+      <button class="exp-btn-ok" onclick="confirmarExportar()">&#128229; Exportar</button>
+    </div>
+  </div>
+</div>
+<!-- ===== MAPA DE EXECUÇÃO ===== -->
+<div id="exec-map-overlay">
+  <div id="em-header">
+    <span id="em-title">&#9889; Mapa de Execu&#231;&#227;o</span>
+    <span id="em-step-info">Pronto</span>
+    <div id="em-controls">
+      <button class="em-ctrl-btn em-btn-play"  id="em-btn-play"  onclick="simPlay()"       title="Executar (F5)">&#9654;</button>
+      <button class="em-ctrl-btn em-btn-pause" id="em-btn-pause" onclick="simPause()"      title="Pausar"  disabled>&#9646;&#9646;</button>
+      <button class="em-ctrl-btn em-btn-step"  id="em-btn-step"  onclick="simStep()"       title="Pr&#243;ximo (F8)">&#9197;</button>
+      <button class="em-ctrl-btn em-btn-stop"  onclick="simStop(false)"                    title="Reiniciar">&#9632;</button>
+      <div class="em-speed-wrap">
+        <span class="em-speed-lbl">Vel</span>
+        <input type="range" id="em-speed" min="1" max="10" value="5" oninput="document.getElementById('sim-speed').value=this.value" title="Velocidade">
+      </div>
+      <button class="em-ctrl-btn em-btn-vars" onclick="_emToggleVars()" title="Vari&#225;veis / Arquivos">&#128203;</button>
+    </div>
+    <button id="em-close-btn" onclick="execMapClose()" title="Fechar Mapa de Execu\u00e7\u00e3o">&#10005;</button>
+  </div>
+  <div id="em-body">
+    <!-- ESQUERDA: log + call stack -->
+    <div id="em-left">
+      <div class="em-panel-hdr">&#128221; LOG DE EXECU&#199;&#195;O</div>
+      <div id="em-log-list"></div>
+      <div id="em-stack-wrap">
+        <div class="em-panel-hdr">&#128221; CALL STACK</div>
+        <div id="em-stack-items"></div>
+      </div>
+    </div>
+    <div id="em-resize-bar"></div>
+    <!-- DIREITA: código COBOL -->
+    <div id="em-right">
+      <div class="em-panel-hdr">&#128196; C&#211;DIGO COBOL &mdash; <span id="em-prog-name" style="color:#a5b4fc;font-weight:400;font-style:italic;"></span></div>
+      <div id="em-code-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== SIMULADOR COBOL ===== -->
+<script src="js/simulator.js?v=20260411"></script>
+<script src="js/report.js?v=20260410c"></script>
+<div id="sim-mode-hint">&#127381; Modo Simulação &mdash; clique em qualquer nó para colocar/remover breakpoint</div>
+
+<div id="sim-panel">
+  <div class="sim-header">
+    <span class="sim-title">&#127381; COBOL Simulator</span>
+    <span class="sim-step-info" id="sim-step-info">Pronto</span>
+    <button class="sim-close-btn" onclick="simStop(true)" title="Fechar simulador">&#10005;</button>
+  </div>
+  <div class="sim-log" id="sim-log">
+    <div class="sim-log-line" id="sim-log-text">Clique ▶ para iniciar a simulação</div>
+  </div>
+  <div class="sim-controls">
+    <button class="sim-btn sim-btn-play"  id="sim-btn-play"  onclick="simPlay()"  title="Executar (auto)">&#9654;</button>
+    <button class="sim-btn sim-btn-pause" id="sim-btn-pause" onclick="simPause()" title="Pausar" disabled>&#9646;&#9646;</button>
+    <button class="sim-btn sim-btn-step"  id="sim-btn-step"  onclick="simStep()"  title="Próximo nó (F8)">&#9197;</button>
+    <button class="sim-btn sim-btn-stop"  id="sim-btn-stop"  onclick="simStop(false)" title="Reiniciar">&#9632;</button>
+    <button class="sim-btn sim-btn-bp"    id="sim-btn-bp-mode" onclick="simToggleBpInfo()" title="Breakpoints: clique nos nós do diagrama">&#128308;</button>
+    <button class="sim-btn" id="sim-btn-vars" onclick="_simToggleVarsPanel()" title="Painel de Variáveis (WORKING-STORAGE)" style="font-size:13px;">&#128203;</button>
+    <div class="sim-speed-wrap">
+      <span class="sim-speed-lbl">Vel</span>
+      <input type="range" id="sim-speed" min="1" max="10" value="5" title="Velocidade da simulação">
+    </div>
+  </div>
+  <div class="sim-stack-wrap" id="sim-stack-wrap">
+    <div class="sim-stack-lbl">&#128221; CALL STACK</div>
+    <div class="sim-stack-items" id="sim-stack-items"></div>
+  </div>
+</div>
+
+<!-- Painel de Variáveis do Simulador -->
+<div id="sim-vars-panel">
+  <div class="sim-vars-header">
+    <span class="sim-vars-title" id="sim-vars-title-txt">&#9632; WORKING-STORAGE / LINKAGE</span>
+    <button class="sim-vars-close" onclick="_simToggleVarsPanel()" title="Fechar painel">&#10005;</button>
+  </div>
+  <!-- Abas VARIÁVEIS / ARQUIVOS -->
+  <div class="sim-panel-tabs">
+    <button class="sim-panel-tab active" id="sim-tab-vars"  onclick="_simSwitchTab('vars')">&#128203; VARIÁVEIS</button>
+    <button class="sim-panel-tab"        id="sim-tab-files" onclick="_simSwitchTab('files')">&#128193; ARQUIVOS</button>
+    <button class="sim-panel-tab"        id="sim-tab-db2"   onclick="_simSwitchTab('db2')">&#128448; DB2</button>
+  </div>
+
+  <!-- Conteúdo: VARIÁVEIS -->
+  <div class="sim-tab-content active" id="sim-tab-vars-content">
+    <div class="sim-vars-filter">
+      <input type="text" id="sim-vars-search" placeholder="FILTRAR VARIAVEL..." oninput="_simFilterVars(this.value)" style="text-transform:uppercase;">
+    </div>
+    <div class="sim-vars-list" id="sim-vars-list">
+      <div style="color:#2d5a3d;font-size:12px;padding:16px 14px;font-family:'Courier New',monospace;">GERE O FLUXO E INICIE A SIMULACAO PARA VER AS VARIAVEIS.</div>
+    </div>
+    <div id="sim-vars-eval-info"></div>
+  </div>
+
+  <!-- Conteúdo: ARQUIVOS -->
+  <div class="sim-tab-content" id="sim-tab-files-content">
+    <div class="sim-vars-list" id="sim-files-list" style="padding:6px 0;">
+      <div class="sim-file-empty">Nenhum arquivo encontrado. Verifique FILE SECTION e FD no código.</div>
+    </div>
+  </div>
+
+  <!-- Conteúdo: DB2 -->
+  <div class="sim-tab-content" id="sim-tab-db2-content">
+    <div class="sim-db2-toolbar">
+      <span class="sim-db2-hint">Importe DDL ou as tabelas serão detectadas do EXEC SQL</span>
+      <label class="sim-db2-import-btn" title="Importar DDL (CREATE TABLE)">
+        &#8645; Importar DDL
+        <input type="file" accept=".sql,.ddl,.txt" style="display:none" onchange="_simDb2ImportDdl(this)">
+      </label>
+    </div>
+    <div id="sim-db2-list" class="sim-vars-list" style="padding:6px 0 0;gap:0">
+      <div class="sim-file-empty">Nenhuma tabela DB2 encontrada. Use EXEC SQL no código ou importe um DDL.</div>
+    </div>
+  </div>
+
+
+</div>
+
+<!-- Modal de escolha de ramo IF/EVALUATE -->
+<div id="sim-branch-modal">
+  <div class="sim-branch-title">&#10067; Qual ramo executar?</div>
+  <div class="sim-branch-cond" id="sim-branch-cond"></div>
+  <div class="sim-branch-btns" id="sim-branch-btns"></div>
+</div>
+
+<!-- Modal de confirmação de reinício -->
+<div id="sim-restart-modal">
+  <div class="sim-branch-title">&#9632; Reiniciar simulação</div>
+  <div class="sim-branch-cond">O que deseja fazer com o log e as variáveis?</div>
+  <div class="sim-branch-btns">
+    <button class="sim-branch-btn no"  onclick="_simRestartDecide('limpar')">&#128465; Limpar tudo</button>
+    <button class="sim-branch-btn yes" onclick="_simRestartDecide('continuar')">&#8635; Continuar</button>
+  </div>
+</div>
+
+<!-- ===== MODAL: IMPORTAR BOOK COBOL ===== -->
+<div id="book-overlay" onclick="bookOverlayClick(event)">
+  <div id="book-modal">
+    <div id="book-modal-header">
+      <h2><span class="bk-hdr-icon">&#128218;</span> COBOL Book Layout</h2>
+      <div class="bk-hdr-actions">
+        <div class="bk-hdr-export-grp">
+          <span class="bk-hdr-export-lbl">Sessão</span>
+          <button class="bk-hdr-export-btn bk-hdr-save-btn" onclick="bkSaveSession()" title="Salvar sessão completa (books + layouts + dados)">&#128190; Salvar</button>
+          <button class="bk-hdr-export-btn" onclick="document.getElementById('bk-session-input').click()" title="Carregar sessão salva anteriormente">&#128228; Carregar</button>
+          <input type="file" id="bk-session-input" accept=".json" style="display:none" onchange="bkLoadSessionFile(event)">
+        </div>
+        <div class="bk-hdr-export-grp">
+          <span class="bk-hdr-export-lbl">Exportar Layout</span>
+          <button class="bk-hdr-export-btn" onclick="bkExportCSV()" title="Exportar CSV">&#128229; CSV</button>
+          <button class="bk-hdr-export-btn" onclick="bkExportJSON()" title="Exportar JSON">{ } JSON</button>
+          <button class="bk-hdr-export-btn" onclick="bkShowLayoutXlsMenu(event)" title="Exportar Excel">&#128202; Excel &#9660;</button>
+        </div>
+        <button id="book-modal-close" onclick="bookCloseModal()" title="Fechar">&#10005;</button>
+      </div>
+    </div>
+
+    <div id="book-modal-body">
+      <!-- ESQUERDO -->
+      <div id="bk-left">
+        <div id="bk-books-hdr">
+          <span>&#128218; Books</span>
+          <button id="bk-btn-novo" onclick="bkAddBook()">+ Novo</button>
+        </div>
+        <div id="bk-books-list"></div>
+
+        <div id="bk-editor-lbl">&#128196; Fonte do book selecionado</div>
+        <div id="book-file-zone"
+             onclick="bkTriggerFile()"
+             ondragover="bkDragOver(event)" ondragleave="bkDragLeave(event)" ondrop="bkDrop(event)"
+             title="Clique ou arraste arquivos .txt (múltiplos aceitos)">
+          <span style="font-size:16px;">&#128229;</span>
+          <span><b>Importar .txt</b> &mdash; clique ou arraste (m&#250;ltiplos)</span>
+        </div>
+        <input type="file" id="book-file-input" accept=".txt,.cpy,.cbl,.cob" multiple style="display:none" onchange="bkFilesSelected(event)">
+        <div id="book-file-name"></div>
+        <!-- Editor COBOL copybook com line numbers + syntax highlight -->
+        <div id="bk-cbl-wrap">
+          <div id="bk-cbl-body">
+            <div id="bk-cbl-ln"></div>
+            <div id="bk-cbl-code">
+              <div id="bk-cbl-hi" aria-hidden="true"></div>
+              <textarea id="book-textarea" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"
+                placeholder="Cole aqui o copybook COBOL..."></textarea>
+            </div>
+          </div>
+        </div>
+        <div id="bk-actions">
+          <button class="bk-btn primary" onclick="bkRunParse()">&#9654; Gerar Layout</button>
+          <button class="bk-btn danger"  onclick="bkClearBook()">&#10005; Limpar</button>
+        </div>
+        <div id="bk-parse-info"></div>
+      </div>
+
+      <!-- DIREITO -->
+      <div id="bk-right">
+        <div id="bk-tabs">
+          <div class="bk-tab active" id="bk-tab-table" onclick="bkSwitchTab('table')"><span class="bk-tab-icon">&#9776;</span> Tabela</div>
+          <div class="bk-tab"        id="bk-tab-map"   onclick="bkSwitchTab('map')"><span class="bk-tab-icon">&#9632;</span> Mapa Visual</div>
+          <div class="bk-tab"        id="bk-tab-tree"  onclick="bkSwitchTab('tree')"><span class="bk-tab-icon">&#127795;</span> &#193;rvore</div>
+          <div class="bk-tab"        id="bk-tab-data"  onclick="bkSwitchTab('data')"><span class="bk-tab-icon">&#128190;</span> Importar Dados</div>
+        </div>
+        <div id="bk-content">
+
+          <div id="bk-panel-table" class="bk-panel active">
+            <div class="bk-empty" id="bk-empty">&#128218; Selecione um book, cole o copybook e clique em <b>Gerar Layout</b>.</div>
+            <!-- Toggle modo layout: texto destrinchado / binário compactado -->
+            <div id="bk-layout-mode-bar" style="display:flex;align-items:center;gap:8px;padding:4px 6px 0;flex-wrap:wrap;">
+              <button id="bk-layout-mode-btn" class="bk-dtb-btn" onclick="bkToggleLayoutMode()" title="Alternar entre layout no arquivo texto e bytes físicos COBOL">&#128230; Modo Binário</button>
+              <span id="bk-layout-mode-lbl" style="font-size:11px;color:#8890b5;">Mostrando: posições no arquivo texto (destrinchado)</span>
+            </div>
+            <div id="bk-stats-bar" style="display:none;"></div>
+            <div id="bk-tbl-wrap" style="display:none;">
+              <table id="bk-table">
+                <thead>
+                  <tr>
+                    <th>#</th><th>Nível</th><th>Nome</th><th>PIC</th>
+                    <th>Tipo</th><th>In&#237;cio</th><th>Tam</th><th>Fim</th><th>REDEFINES</th>
+                  </tr>
+                </thead>
+                <tbody id="bk-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div id="bk-panel-map" class="bk-panel">
+            <div id="bk-map-content"><div class="bk-empty">Gere o layout primeiro.</div></div>
+          </div>
+
+          <div id="bk-panel-tree" class="bk-panel">
+            <div id="bk-tree-root"><div class="bk-empty">Gere o layout primeiro.</div></div>
+          </div>
+
+          <div id="bk-panel-data" class="bk-panel">
+            <!-- Toolbar -->
+            <div class="bk-data-toolbar">
+
+              <!-- ++ Novo registro -->
+              <div class="bk-dtb-group">
+                <button class="bk-dtb-btn bk-dtb-primary" onclick="bkDataAddRow()" title="Adicionar nova linha">&#43; Linha</button>
+              </div>
+
+              <!-- Importar (dropdown) -->
+              <div class="bk-dtb-group">
+                <div class="bk-dtb-dropdown">
+                  <button class="bk-dtb-btn" onclick="bkDtbToggleMenu(event,'bk-menu-import')" title="Importar dados">
+                    &#128230; Importar &#9660;
+                  </button>
+                  <div class="bk-dtb-menu" id="bk-menu-import">
+                    <div class="bk-dtb-menu-sec">TXT Posicional</div>
+                    <button class="bk-dtb-menu-item" onclick="bkDataTriggerTxt()"    title="Campos COMP-3 expandidos como dígitos">&#128462; Padrão</button>
+                    <button class="bk-dtb-menu-item" onclick="bkDataTriggerTxtFis()" title="Layout COBOL físico, conteúdo em texto puro">&#128462; Físico</button>
+                    <button class="bk-dtb-menu-item" onclick="bkDataTriggerTxtComp()" title="TXT com bytes COMP embutidos">&#128462; +COMP</button>
+                    <div class="bk-dtb-menu-div"></div>
+                    <div class="bk-dtb-menu-sec">Binário</div>
+                    <button class="bk-dtb-menu-item" onclick="bkDataTriggerBin()" title="COMP-3/COMP/BINARY decodificados automaticamente">&#128230; Binário COBOL</button>
+                    <div class="bk-dtb-menu-div"></div>
+                    <div class="bk-dtb-menu-sec">Planilha / Estruturado</div>
+                    <button class="bk-dtb-menu-item" onclick="bkDataTriggerFile()"  title="Importar planilha Excel ou CSV">&#128202; Excel / CSV</button>
+                    <button class="bk-dtb-menu-item" onclick="bkDataTriggerJson()"  title="Importar arquivo JSON">&#128195; JSON</button>
+                    <button class="bk-dtb-menu-item" onclick="bkDataToggleRaw()"    title="Colar dados brutos diretamente">&#128196; Bruto</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Formatos -->
+              <div class="bk-dtb-group">
+                <button class="bk-dtb-btn bk-dtb-btn-fmt" onclick="bkOpenFmtDialog()"
+                  title="Configurar formatos dos campos (CPF, data, valor…)">
+                  &#9881; Formatos
+                </button>
+              </div>
+
+              <!-- Exportar (dropdown) -->
+              <div class="bk-dtb-group">
+                <div class="bk-dtb-dropdown">
+                  <button class="bk-dtb-btn" onclick="bkDtbToggleMenu(event,'bk-menu-export')" title="Exportar dados">
+                    &#8659; Exportar &#9660;
+                  </button>
+                  <div class="bk-dtb-menu" id="bk-menu-export">
+                    <button class="bk-dtb-menu-item" onclick="bkDataExportCsv()">&#8659; CSV</button>
+                    <button class="bk-dtb-menu-item" onclick="bkDataExportTxt()">&#8659; TXT posicional</button>
+                    <button class="bk-dtb-menu-item" onclick="bkDataShowXlsMenu(event)" id="bk-dtb-xls-btn">&#8659; Excel</button>
+                    <button class="bk-dtb-menu-item" onclick="bkDataExportJson()">&#8659; JSON</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Visualização -->
+              <div class="bk-dtb-group">
+                <button class="bk-dtb-btn bk-dtb-view-active" id="bk-dtb-view-btn"
+                  onclick="bkDataToggleView()" title="Alternar visualização horizontal/vertical">
+                  &#8661; Vertical
+                </button>
+              </div>
+
+              <!-- Limpar (à direita) -->
+              <div class="bk-dtb-group" style="margin-left:auto;">
+                <button class="bk-dtb-btn bk-dtb-danger" onclick="bkDataClear()" title="Limpar todos os dados importados">
+                  &#128465; Limpar
+                </button>
+              </div>
+
+              <!-- File inputs ocultos -->
+              <input type="file" id="bk-data-file-txt"      accept=".txt,.dat,.cob"       style="display:none" onchange="bkDataImportTxtFile(this)">
+              <input type="file" id="bk-data-file-txt-fis"  accept=".txt,.dat,.cob,*/*"   style="display:none" onchange="bkDataImportTxtFisFile(this)">
+              <input type="file" id="bk-data-file-txt-comp" accept="*/*"                  style="display:none" onchange="bkDataImportTxtCompFile(this)">
+              <input type="file" id="bk-data-file-bin"      accept="*/*"                  style="display:none" onchange="bkDataImportBinFile(this)">
+              <input type="file" id="bk-data-file-exc"      accept=".csv,.tsv,.xlsx,.xls" style="display:none" onchange="bkDataImportTableFile(this)">
+              <input type="file" id="bk-data-file-json"     accept=".json"                style="display:none" onchange="bkDataImportJsonFile(this)">
+            </div>
+            <!-- Filtro colunas REDEFINES -->
+            <div id="bk-data-redef-bar" class="bk-data-redef-bar hidden">
+              <span class="bk-data-redef-lbl">&#8644; Colunas:</span>
+              <div id="bk-data-redef-groups"></div>
+            </div>
+            <!-- Chave discriminadora REDEFINES automático -->
+            <div id="bk-data-key-bar" class="bk-data-key-bar hidden">
+              <span class="bk-data-key-lbl" onclick="bkKeyBarToggle()">&#128273; Chave discriminadora automática<span class="bk-data-key-arrow">&#9660;</span></span>
+              <div class="bk-data-key-bar-inner">
+                <div id="bk-data-key-groups" style="display:flex;flex-direction:column;gap:8px;"></div>
+              </div>
+            </div>
+            <!-- Área colar bruto (colapsável) -->
+            <div id="bk-data-raw-bar" class="bk-data-raw-bar hidden">
+              <textarea id="bk-data-raw" rows="3" placeholder="Cole os registros brutos (1 linha = 1 registro)…"></textarea>
+              <button class="bk-data-raw-dec" onclick="bkDataDecodeRawPaste()">&#9654; Decodificar</button>
+            </div>
+            <!-- Grade de dados -->
+            <div class="bk-data-grid-wrap" id="bk-data-grid-wrap">
+              <div class="bk-data-empty">Gere o layout e adicione registros.</div>
+            </div>
+            <!-- Paginador externo (sempre visível fora do scroll área) -->
+            <div id="bk-dg-footer-pager" class="bk-dg-footer-pager" style="display:none;"></div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="bk-tooltip"></div>
+<div id="ide-toast"></div>
+
+<!-- ===== MODAL: BANCO DE DADOS (DDL / DCLGEN) ===== -->
+<div id="db-overlay" onclick="dbOverlayClick(event)">
+  <div id="db-modal">
+    <div id="db-modal-header">
+      <h2><span class="db-hdr-icon">&#128451;</span> Banco de Dados — DDL / DCLGEN</h2>
+      <div class="db-hdr-actions">
+        <button class="db-hdr-btn" onclick="_dbAllCobolToClipboard()" title="Copiar COBOL de todas as tabelas">&#128203; Copiar Tudo</button>
+        <button id="db-modal-close" onclick="dbCloseModal()" title="Fechar">&#10005;</button>
+      </div>
+    </div>
+
+    <div id="db-modal-body">
+      <!-- ESQUERDO: lista de tabelas -->
+      <div id="db-left">
+        <div id="db-tables-hdr">
+          <span>&#128451; Tabelas <span id="db-tables-cnt"></span></span>
+          <button id="db-btn-importar" onclick="dbTriggerImport()">&#65291; Importar</button>
+        </div>
+        <div id="db-tables-list"></div>
+
+        <div id="db-drop-zone"
+             onclick="dbTriggerImport()"
+             ondragover="event.preventDefault();this.classList.add('db-drop-hover')"
+             ondragleave="this.classList.remove('db-drop-hover')"
+             ondrop="this.classList.remove('db-drop-hover');_dbDropFile(event)">
+          <div class="db-drop-icon">&#128451;</div>
+          <div class="db-drop-text">Arraste ou clique<br>para importar</div>
+          <div class="db-drop-hint">.sql &nbsp;.ddl &nbsp;.cpy &nbsp;.dclgen &nbsp;.txt</div>
+        </div>
+        <input type="file" id="db-file-input"      accept=".sql,.ddl,.cpy,.dclgen,.dcl,.txt" multiple style="display:none" onchange="dbImportFile(event)">
+        <input type="file" id="db-data-file-txt"  accept=".txt,.dat,.cob,*/*"              style="display:none" onchange="_dbDataImportTxtFile(this)">
+        <input type="file" id="db-data-file-csv"  accept=".csv,.tsv,.xlsx,.xls"             style="display:none" onchange="_dbDataImportCsvFile(this)">
+        <input type="file" id="db-data-file-json" accept=".json"                            style="display:none" onchange="_dbDataImportJsonFile(this)">
+      </div>
+
+      <!-- DIREITO: conteúdo das abas -->
+      <div id="db-right">
+        <div id="db-tabs">
+          <button class="db-tab db-tab--active" id="db-tab-cols"  onclick="_dbShowTab('cols')">&#128202; Colunas SQL</button>
+          <button class="db-tab"                id="db-tab-cobol" onclick="_dbShowTab('cobol')">&#128196; Variáveis COBOL</button>
+          <button class="db-tab"                id="db-tab-data"  onclick="_dbShowTab('data')">&#8659; Dados</button>
+        </div>
+        <div id="db-main-pane">
+          <div class="db-empty-main">Importe um arquivo <b>DDL</b> (.sql, .ddl)<br>ou <b>DCLGEN</b> (.cpy, .dclgen) para começar.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="js/copybook.js?v=20260410f"></script>
+<script src="js/db.js?v=20260411"></script>
+
+</body>
+</html>
