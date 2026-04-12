@@ -21,25 +21,59 @@ var _simDb2Cursors  = {};  // { 'C1': { tableName, cols, pointer, isOpen } }
 function _parseWsVars(code) {
   var result = [];
   if (!code) return result;
-  var lines = code.split('\n');
+  // ── Pré-processamento ─────────────────────────────────────────────────────
+  // Passo 1: une linhas de continuação COBOL (indicador '-' na coluna 7)
+  //   Ex.:  "       05 WS-MSG PIC X(40) VALUE 'PARTE UM"
+  //         "-                'PARTE DOIS'."
+  var rawLines = code.split('\n');
+  var _step1 = [];
+  rawLines.forEach(function(rl) {
+    if (rl.length >= 7 && rl[6] === '-') {
+      var cont = rl.length > 11 ? rl.slice(11).trim() : '';
+      if (_step1.length) {
+        var prev = _step1[_step1.length - 1];
+        // continuação de literal: remove a aspa de abertura e concatena ao texto anterior
+        if (cont.startsWith("'") || cont.startsWith('"')) {
+          _step1[_step1.length - 1] = prev.replace(/\s+$/, '') + cont.slice(1);
+        } else {
+          _step1[_step1.length - 1] = prev + ' ' + cont;
+        }
+      } else { _step1.push(rl); }
+    } else { _step1.push(rl); }
+  });
+
+  // Passo 2: normaliza (remove prefixo de 6 colunas) e une linhas físicas da
+  //   mesma declaração DATA DIVISION que se estendem pela linha seguinte sem '-'
+  //   Ex.:  "       05 WS-CAMPO PIC X(10)"
+  //         "                   VALUE 'ABC'."
+  var lines = [];
+  _step1.forEach(function(rl) {
+    var norm = rl;
+    if (rl.length >= 7) {
+      var c7 = rl[6];
+      if (/^[\d ]{6}/.test(rl) || (/^[A-Za-z0-9 ]{6}/.test(rl) && (c7 === ' ' || c7 === '*' || c7 === '/'))) {
+        norm = rl.slice(6);
+      }
+    }
+    var lt = norm.trim();
+    if (!lt || lt[0] === '*' || lt[0] === '/' || lt.startsWith('*>') || lt.startsWith('*')) return;
+    var luTest = lt.toUpperCase();
+    var isNewDecl = /^\d{1,2}\s+[A-Z@#$]/.test(luTest) ||
+      /^(FILE|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE|SCREEN|REPORT|COMMUNICATION|PROGRAM-LIBRARY|PROCEDURE)\s+(SECTION|DIVISION)\b/.test(luTest) ||
+      /^[SF]D\s+/.test(luTest);
+    if (isNewDecl) { lines.push(lt); }
+    else if (lines.length) { lines[lines.length - 1] += ' ' + lt; }
+    else { lines.push(lt); }
+  });
+  // ──────────────────────────────────────────────────────────────────────────
+
   // sections que interessam: FILE, WORKING-STORAGE, LOCAL-STORAGE, LINKAGE
   var inSection = false;
   var currentSection = '';
-  var sections = { 'FILE': true, 'WORKING-STORAGE': true, 'LOCAL-STORAGE': true, 'LINKAGE': true };
   var lastNon88Name = ''; // para vincular nível 88 ao pai
   var lastFdName    = ''; // FD/SD atual dentro do FILE SECTION
-  lines.forEach(function(rawLine) {
-    if (!rawLine) return;
-    var normalized = rawLine;
-    if (rawLine.length >= 7) {
-      var c7 = rawLine[6];
-      if (/^[\d ]{6}/.test(rawLine) || (/^[A-Za-z0-9 ]{6}/.test(rawLine) && (c7 === ' ' || c7 === '*' || c7 === '/'))) {
-        normalized = rawLine.slice(6);
-      }
-    }
-    if (!normalized || normalized[0] === '*' || normalized[0] === '/') return;
-    var lt = normalized.trim();
-    if (!lt || lt.startsWith('*>') || lt.startsWith('*')) return;
+  lines.forEach(function(lt) {  // lt já normalizado e trimado pelo pré-processamento
+    if (!lt) return;
     var lu = lt.toUpperCase();
     // Detecta início de seção de interesse
     var secM = lu.match(/^(FILE|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE)\s+SECTION\b/);
