@@ -32,9 +32,19 @@ function _parseWsVars(code) {
       var cont = rl.length > 11 ? rl.slice(11).trim() : '';
       if (_step1.length) {
         var prev = _step1[_step1.length - 1];
-        // continuação de literal: remove a aspa de abertura e concatena ao texto anterior
         if (cont.startsWith("'") || cont.startsWith('"')) {
-          _step1[_step1.length - 1] = prev.replace(/\s+$/, '') + cont.slice(1);
+          // Se a linha anterior já fechou o literal (termina com ' ou "), o ' da
+          // continuação abre um novo trecho adjacente — mantemos a aspa.
+          // Se o literal ainda está aberto (sem fechar), o ' é só marcador — removemos.
+          var prevTrimmed = prev.trimEnd();
+          var lastChar    = prevTrimmed[prevTrimmed.length - 1];
+          if (lastChar === "'" || lastChar === '"') {
+            // literal fechado: mantém a aspa da continuação (sera detectada como novo trecho)
+            _step1[_step1.length - 1] = prev + ' ' + cont;
+          } else {
+            // literal ainda aberto: remove a aspa marcadora de continuação
+            _step1[_step1.length - 1] = prev + cont.slice(1);
+          }
         } else {
           _step1[_step1.length - 1] = prev + ' ' + cont;
         }
@@ -127,23 +137,41 @@ function _parseWsVars(code) {
         if (lm) len = parseInt(lm[1], 10);
         else len = (pU.match(/[X9A]/g) || []).length || 1;
       }
-      // VALUE clause (pode ter string com espaços)
-      var valM = rest.match(/\bVALUE\s+(?:IS\s+)?((?:'[^']*'|"[^"]*"|[^\s.]+))/i);
-      if (valM) {
-        var vStr = valM[1];
-        var vU   = vStr.toUpperCase();
-        if ((vStr.startsWith("'") && vStr.endsWith("'")) || (vStr.startsWith('"') && vStr.endsWith('"'))) {
-          defVal = vStr.slice(1, -1);
-        } else if (vU === 'SPACES' || vU === 'SPACE') {
-          defVal = '';
-        } else if (vU === 'ZEROS' || vU === 'ZEROES' || vU === 'ZERO') {
-          defVal = picType === '9' ? '0' : '0';
-        } else if (vU === 'HIGH-VALUES' || vU === 'HIGH-VALUE') {
-          defVal = '\xFF';
-        } else if (vU === 'LOW-VALUES' || vU === 'LOW-VALUE') {
-          defVal = '\x00';
+      // VALUE clause — suporta literais adjacentes resultantes de continuação COBOL
+      // Ex.: VALUE 'elaine '  mirella'. (após join de linhas com -)
+      var valBeginM = rest.match(/\bVALUE\s+(?:IS\s+)?([\s\S]+)/i);
+      if (valBeginM) {
+        var valRaw = valBeginM[1].replace(/\.\s*$/, '').trim();
+        var q0 = valRaw[0];
+        if (q0 === "'" || q0 === '"') {
+          // Coleta e concatena todos os literais string adjacentes
+          var collected = '';
+          var ci = 0;
+          while (ci < valRaw.length) {
+            var qc = valRaw[ci];
+            if (qc === "'" || qc === '"') {
+              var qEnd = valRaw.indexOf(qc, ci + 1);
+              if (qEnd === -1) { collected += valRaw.slice(ci + 1); break; }
+              collected += valRaw.slice(ci + 1, qEnd);
+              ci = qEnd + 1;
+              while (ci < valRaw.length && (valRaw[ci] === ' ' || valRaw[ci] === '\t')) ci++;
+            } else { break; }
+          }
+          defVal = collected;
         } else {
-          defVal = vStr;
+          var vStr = valRaw.split(/[\s.]/)[0];
+          var vU   = vStr.toUpperCase();
+          if (vU === 'SPACES' || vU === 'SPACE') {
+            defVal = '';
+          } else if (vU === 'ZEROS' || vU === 'ZEROES' || vU === 'ZERO') {
+            defVal = picType === '9' ? '0' : '0';
+          } else if (vU === 'HIGH-VALUES' || vU === 'HIGH-VALUE') {
+            defVal = '\xFF';
+          } else if (vU === 'LOW-VALUES' || vU === 'LOW-VALUE') {
+            defVal = '\x00';
+          } else {
+            defVal = vStr;
+          }
         }
       } else {
         defVal = picType === '9' ? '0' : '';
