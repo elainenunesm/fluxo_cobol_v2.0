@@ -2979,6 +2979,7 @@ function bkDataShowXlsMenu(e) {
   if (hasVariants) {
     html += '<button onclick="_bkClosePopup();bkDataExportXls(\'tabs\')">&#128218; Abas separadas por variante</button>';
   }
+  html += '<button onclick="_bkClosePopup();bkDataShowGroupKeyPicker()">&#128273; Agrupado por chave</button>';
   pop.innerHTML = html;
 
   document.body.appendChild(ov);
@@ -3067,6 +3068,118 @@ function bkDataExportXls(mode) {
 </Workbook>`;
 
   bkDownloadBlob(xml, book.name + '-dados.xls', 'application/vnd.ms-excel;charset=utf-8');
+}
+
+// ================================================================
+// EXPORT AGRUPADO POR CHAVE
+// ================================================================
+function bkDataShowGroupKeyPicker() {
+  const book = bkGetActive(); if (!book) return;
+  const rows = bkDataGetRows(); if (!rows.length) { alert('Sem dados para exportar.'); return; }
+
+  // Campos selecionáveis = campos folha do layout base (sem variantes)
+  const baseCols = bkDataVariantCols(book, null).filter(f => !f.isGroup && !f.is88 && !f.isVarcharLen);
+  if (!baseCols.length) { alert('Nenhum campo disponível para agrupamento.'); return; }
+
+  const ov = document.createElement('div');
+  ov.className = 'bk-popup-overlay'; ov.id = 'bk-popup-ov'; ov.onclick = _bkClosePopup;
+
+  const pop = document.createElement('div');
+  pop.className = 'bk-popup-wrap'; pop.id = 'bk-popup-main';
+  pop.style.cssText = 'position:fixed;top:15%;left:50%;transform:translateX(-50%);min-width:280px;max-height:70vh;overflow-y:auto;z-index:10001;';
+
+  let html = '<div class="bk-pop-title">&#128273; Campos-chave de agrupamento</div>';
+  html += '<div style="font-size:11px;color:#aaa;margin-bottom:8px;padding:0 4px">Selecione os campos que formam o grupo. A cada mudança de valor, uma nova seção é criada.</div>';
+  html += '<div style="max-height:300px;overflow-y:auto;padding:0 4px">';
+  baseCols.forEach((f, i) => {
+    html += `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">` +
+      `<input type="checkbox" id="bk-grp-key-${i}" value="${f.name}" style="cursor:pointer">` +
+      `<span style="font-family:monospace">${f.name}</span>` +
+      `<span style="color:#666;font-size:10px">${f.pic || ''}</span>` +
+      `</label>`;
+  });
+  html += '</div>';
+  html += '<div style="margin-top:10px;display:flex;gap:8px;padding:4px">';
+  html += '<button class="bk-btn primary" style="flex:1" onclick="' +
+    'var kf=Array.from(document.querySelectorAll(\'[id^=\\\"bk-grp-key-\\\"]:checked\')).map(c=>c.value);' +
+    '_bkClosePopup();' +
+    'if(kf.length)bkDataExportXlsGrouped(kf);else alert(\'Selecione ao menos um campo.\')' +
+    '">&#128229; Exportar</button>';
+  html += '<button class="bk-btn" onclick="_bkClosePopup()">Cancelar</button>';
+  html += '</div>';
+
+  pop.innerHTML = html;
+  document.body.appendChild(ov);
+  document.body.appendChild(pop);
+}
+
+function bkDataExportXlsGrouped(keyFieldNames) {
+  const book = bkGetActive(); if (!book) return;
+  const rows = bkDataGetRows();
+  if (!rows.length) { alert('Sem dados para exportar.'); return; }
+
+  const esc  = s => String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const cell = (val, type, style) =>
+    `<Cell${style ? ` ss:StyleID="${style}"` : ''}><Data ss:Type="${type}">${esc(val)}</Data></Cell>`;
+
+  // Usa colunas base para ter layout estável; campos de variante ficam em branco quando ausentes
+  const allCols  = bkDataVariantCols(book, null);
+  const nCols    = allCols.length || 1;
+
+  // Cabeçalho global
+  let tbl = `<Row>${allCols.map(c => cell(c.name, 'String', 'hdr')).join('')}</Row>\n`;
+
+  let prevKey = null;
+
+  rows.forEach(row => {
+    const flds = _bkRowFields(row, book);
+
+    // Chave atual = valores dos campos selecionados concatenados
+    const curKey = keyFieldNames.map(kn => (flds[kn] || '').toString().trim()).join('\x00');
+
+    if (curKey !== prevKey) {
+      // Linha em branco separadora (exceto no primeiro grupo)
+      if (prevKey !== null) {
+        tbl += `<Row><Cell ss:MergeAcross="${nCols - 1}"><Data ss:Type="String"></Data></Cell></Row>\n`;
+      }
+      // Linha de cabeçalho do grupo com valores das chaves
+      const keyLabel = keyFieldNames.map(kn => `${kn}: ${(flds[kn] || '').toString().trim()}`).join('   ');
+      tbl += `<Row><Cell ss:MergeAcross="${nCols - 1}" ss:StyleID="grp"><Data ss:Type="String">${esc(keyLabel)}</Data></Cell></Row>\n`;
+      // Sub-cabeçalho de colunas
+      tbl += `<Row>${allCols.map(c => cell(c.name, 'String', 'hdr')).join('')}</Row>\n`;
+      prevKey = curKey;
+    }
+
+    // Linha de dados — alinha com allCols (campos de variante ficam vazios)
+    const varColsSet = new Set(bkDataVariantCols(book, row.variant || null).map(c => c.name));
+    tbl += `<Row>${allCols.map(c => {
+      if (!varColsSet.has(c.name)) return cell('', 'String');
+      const cfg = _bkGetFmt(book.id, c.name);
+      const v   = cfg ? _bkApplyFieldFmt(flds[c.name] || '', cfg) : (flds[c.name] || '');
+      return cell(v, 'String');
+    }).join('')}</Row>\n`;
+  });
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+  xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"
+  xmlns:x="urn:schemas-microsoft-com:office:excel">
+  <Styles>
+    <Style ss:ID="hdr">
+      <Font ss:Bold="1" ss:Color="#FFFFFF"/>
+      <Interior ss:Color="#1A237E" ss:Pattern="Solid"/>
+    </Style>
+    <Style ss:ID="grp">
+      <Font ss:Bold="1" ss:Color="#1A237E"/>
+      <Interior ss:Color="#D0D8FF" ss:Pattern="Solid"/>
+    </Style>
+  </Styles>
+  <Worksheet ss:Name="${esc(book.name).substring(0, 31)}"><Table>${tbl}</Table></Worksheet>
+</Workbook>`;
+
+  bkDownloadBlob(xml, book.name + '-agrupado.xls', 'application/vnd.ms-excel;charset=utf-8');
 }
 
 function bkDataExportJson() {
