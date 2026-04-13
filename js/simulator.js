@@ -120,6 +120,10 @@ function _parseWsVars(code) {
     var level   = parseInt(lvlM[1], 10);
     var name    = lvlM[2];
     var rest    = lvlM[3] || '';
+    // restOrig: mesmo trecho que rest, mas a partir de lt (case original).
+    // Necessário para preservar o conteúdo de literais VALUE como 'Abc' (sem converter para 'ABC').
+    var _lvlMorig = lt.match(/^(\d{1,2})\s+([A-Za-z@#$][A-Za-z0-9@#$-]*)(.*)$/);
+    var restOrig  = _lvlMorig ? (_lvlMorig[3] || '') : rest;
     // 88 = nome de condição — armazena ligado à variável pai
     if (level === 88) {
       var v88M = rest.replace(/\.$/, '').match(/\bVALUES?\s+(.+)$/i);
@@ -152,7 +156,8 @@ function _parseWsVars(code) {
       }
       // VALUE clause — suporta literais adjacentes resultantes de continuação COBOL
       // Ex.: VALUE 'elaine '  mirella'. (após join de linhas com -)
-      var valBeginM = rest.match(/\bVALUE\s+(?:IS\s+)?([\s\S]+)/i);
+      // Usa restOrig (case original de lt) para preservar o conteúdo dos literais string.
+      var valBeginM = restOrig.match(/\bVALUE\s+(?:IS\s+)?([\s\S]+)/i);
       if (valBeginM) {
         var valRaw = valBeginM[1].replace(/\.\s*$/, '').trim();
         var q0 = valRaw[0];
@@ -1568,10 +1573,24 @@ function _simResetFilePointers() {
 }
 
 // Executa um WRITE simulado: captura valores dos campos e insere na tabela do arquivo
+// labelU pode conter '\x00<detail>' apendado para acesso à instrução original (FROM)
 function _simDoWrite(labelU, isRewrite) {
-  // Label: "WRITE\nARQ-SAIDA" ou "REWRITE\nARQ-SAIDA" — extrai o nome do arquivo pela 2ª linha
-  var lines = labelU.split(/\r?\n/);
-  var fdName = (lines[1] || lines[0]).replace(/^(?:WRITE|REWRITE)\s+/i, '').trim();
+  // Separa label do detail (separador \x00 adicionado pelo chamador)
+  var _nullIdx  = labelU.indexOf('\x00');
+  var _detail   = _nullIdx >= 0 ? labelU.substring(_nullIdx + 1) : '';
+  var _labelPure = _nullIdx >= 0 ? labelU.substring(0, _nullIdx) : labelU;
+
+  // Label: "WRITE\nARQ-SAIDA" — 2ª linha é o nome do FD/arquivo
+  var lines = _labelPure.split(/\r?\n/);
+  var fdName = (lines[1] || lines[0]).replace(/^(?:WRITE|REWRITE)\s+/i, '').trim()
+                                      .replace(/\s+FROM\s+.*$/i, '').trim(); // remove FROM ...
+
+  // Detecta FROM na instrução completa: WRITE reg FROM ws-var
+  // Procura no detail (instrução original multi-linha) ou na linha do label
+  var _fromVar = null;
+  var _fromSrc = (_detail || _labelPure).toUpperCase();
+  var _fromM   = _fromSrc.match(/\bFROM\s+([A-Z][A-Z0-9-]*)/);
+  if (_fromM) _fromVar = _fromM[1];
   // Se não tem FD configurado ainda, cria automaticamente com campos do FILE SECTION
   if (!_simFiles[fdName]) {
     // Procura campos com esse fdName
@@ -1601,6 +1620,61 @@ function _simDoWrite(labelU, isRewrite) {
     return;
   }
   fd.isOutput = true;
+  // ── FROM ws-var: copia campos da WS para os campos do FD ─────
+  // WRITE ARQ-SAIDA FROM WS-REG → equivale a MOVE WS-REG TO ARQ-SAIDA antes do WRITE.
+  // Estratégia: se _fromVar é um grupo, pega todos os vars da WS cujo fdName não seja
+  // definido ou cujo pai (group) tenha esse nome — e mapeia pelos campos do FD em ordem.
+  if (_fromVar) {
+    // 1) Tenta mapear por nome: campos do FD que existam com o mesmo nome na WS
+    var _fdFields = _simGetActiveFields ? _simGetActiveFields(fdName) : (fd.fields || []);
+    var _mappedAny = false;
+    _fdFields.forEach(function(fld) {
+      if (_simVars.hasOwnProperty(fld)) return; // já sincronizado
+      // Procura campo equivalente na WS (ex: FD tem CAMPO-X, WS tem CAMPO-X também)
+      // Isso acontece quando as áreas são REDEFINES ou compartilham nomes
+    });
+    // 2) Tenta copiar a partir do grupo WS: filhos diretos do grupo _fromVar em _simVarDefs
+    var _wsGroupChildren = [];
+    var _inGroup = false;
+    _simVarDefs.forEach(function(v) {
+      if (v.name === _fromVar && v.isGroup) { _inGroup = true; return; }
+      if (_inGroup) {
+        if (v.level <= (_simVarDefs.find(function(d){ return d.name === _fromVar; }) || {}).level) {
+          _inGroup = false; return;
+        }
+        if (!v.isGroup && !v.is88) _wsGroupChildren.push(v.name);
+      }
+    });
+    if (_wsGroupChildren.length > 0) {
+      // Mapeia na ordem: campos do FD ↔ campos do grupo WS (posicionalmente)
+      var _fdF2 = fd.fields.length ? fd.fields : _fdFields;
+      _fdF2.forEach(function(fld, idx) {
+        var src = _wsGroupChildren[idx];
+        if (src && _simVars.hasOwnProperty(src)) {
+          _simSetVarInternal(fld, _simVars[src]);
+        }
+      });
+      _simLog('  ↳ FROM ' + _fromVar + ' → ' + _wsGroupChildren.length + ' campo(s) copiado(s) para ' + fdName, 'sim-log-file-var');
+      _mappedAny = true;
+    }
+    if (!_mappedAny) {
+      // Fallback: _fromVar é uma variável elementar (área de trabalho do mesmo tamanho)
+      // Tenta distribuir o valor bruto da string pelos campos do FD por offset/tamanho
+      var _rawVal = _simVars[_fromVar] !== undefined ? String(_simVars[_fromVar]) : null;
+      if (_rawVal !== null) {
+        var _fdFld3 = fd.fields.length ? fd.fields : _fdFields;
+        var _off = 0;
+        _fdFld3.forEach(function(fld) {
+          var _meta = _simVarDefs.find(function(d){ return d.name === fld && !d.isGroup; });
+          var _len  = _meta ? (_meta.len || 1) : 1;
+          var _slice = _rawVal.substring(_off, _off + _len);
+          _simSetVarInternal(fld, _slice);
+          _off += _len;
+        });
+        _simLog('  ↳ FROM ' + _fromVar + ' (elementar) → distribuído por offset nos campos de ' + fdName, 'sim-log-file-var');
+      }
+    }
+  }
   // Captura snapshot dos valores atuais dos campos do FD
   var rec = {};
   fd.fields.forEach(function(f) {
@@ -3436,6 +3510,8 @@ function _simAdvance() {
       if (tipo === 'write') {
         _pendWriteLbl  = (curNode.data('label') || '');
         _pendWriteVerb = (curNode.data('writeVerb') || _pendWriteLbl.split('\n')[0] || '').toUpperCase();
+        // Inclui o detail para que _simDoWrite consiga extrair FROM ws-var
+        _pendWriteLbl = _pendWriteLbl + '\x00' + (curNode.data('detail') || '');
       }
       _sim.step++;
       _simHighlight(nexts[0].id());
@@ -3456,6 +3532,38 @@ function _simAdvance() {
       var condText = curNode.data('label') || '';
       var condNorm = condText.replace(/\r?\n/g,' ').replace(/\s+/g,' ').trim().toUpperCase();
       var evalResult = null;
+
+      // ── Modo FAKE: usa a fila de desvios com prioridade ──────────
+      // Deve ser verificada ANTES de qualquer auto-avaliação para evitar
+      // dessincronia na fila (nivel-88 pode ser avaliado automaticamente
+      // usando o valor injetado, mas o fake escolheu o ramo oposto).
+      if (typeof _fakeSimActive !== 'undefined' && _fakeSimActive
+          && typeof _fakeSimBranchQueue !== 'undefined'
+          && _fakeSimBranchQueueIdx < _fakeSimBranchQueue.length) {
+        var _fqe = _fakeSimBranchQueue[_fakeSimBranchQueueIdx];
+        if (_fqe.nodeId === curNode.id()) {
+          _fakeSimBranchQueueIdx++;
+          var _fakeChosen = nexts.find(function(n){ return n.id() === _fqe.chosenEdge; });
+          if (_fakeChosen) {
+            _simLog('🎭 Auto-desvio (IF): ' + (_fqe.edgeLabel || '?'), 'sim-log-branch');
+            if (typeof _repOnBranch === 'function') _repOnBranch(condText.split('\n')[0].substring(0,80), _fqe.edgeLabel || '?', true);
+            var _infoElFq = document.getElementById('sim-vars-eval-info');
+            if (_infoElFq) { _infoElFq.textContent = '🎭 ' + (_fqe.edgeLabel || '?'); _infoElFq.className = 'success'; }
+            _sim.step++;
+            if (_fakeChosen.data('tipo') === 'merge' || !_fakeChosen.data('tipo')) {
+              var _fqMergeNexts = _simNextNodes(_fakeChosen.id());
+              if (_fqMergeNexts.length > 0) {
+                _simHighlight(_fqMergeNexts[0].id()); _simLogNode(_fqMergeNexts[0].id());
+                _simStepInfo(); _simCheckBreak(_fqMergeNexts[0].id(), resolve);
+              } else { _simHighlight(_fakeChosen.id()); _simStepInfo(); resolve(true); }
+              return;
+            }
+            _simHighlight(_fakeChosen.id()); _simLogNode(_fakeChosen.id());
+            _simStepInfo(); _simCheckBreak(_fakeChosen.id(), resolve);
+            return;
+          }
+        }
+      }
 
       // Caso especial: AT END? / INVALID KEY? — resultado do último READ
       if (condNorm === 'AT END?' || condNorm === 'INVALID KEY?') {
@@ -3561,6 +3669,26 @@ function _simAdvance() {
 
     // EVALUATE: avalia automaticamente usando variáveis conhecidas
     if (tipo === 'evaluate') {
+      // ── Modo FAKE: fila tem prioridade sobre auto-eval ──────────
+      if (typeof _fakeSimActive !== 'undefined' && _fakeSimActive
+          && typeof _fakeSimBranchQueue !== 'undefined'
+          && _fakeSimBranchQueueIdx < _fakeSimBranchQueue.length) {
+        var _fqeEv = _fakeSimBranchQueue[_fakeSimBranchQueueIdx];
+        if (_fqeEv.nodeId === curNode.id()) {
+          _fakeSimBranchQueueIdx++;
+          var _fakeChosenEv = nexts.find(function(n){ return n.id() === _fqeEv.chosenEdge; });
+          if (_fakeChosenEv) {
+            _simLog('🎭 Auto-desvio (EVALUATE): ' + (_fqeEv.edgeLabel || '?'), 'sim-log-branch');
+            if (typeof _repOnBranch === 'function') _repOnBranch((curNode.data('label') || '').substring(0,80), _fqeEv.edgeLabel || '?', true);
+            var _infoElFqEv = document.getElementById('sim-vars-eval-info');
+            if (_infoElFqEv) { _infoElFqEv.textContent = '🎭 WHEN ' + (_fqeEv.edgeLabel || '?'); _infoElFqEv.className = 'success'; }
+            _sim.step++;
+            _simHighlight(_fakeChosenEv.id()); _simLogNode(_fakeChosenEv.id());
+            _simStepInfo(); _simCheckBreak(_fakeChosenEv.id(), resolve);
+            return;
+          }
+        }
+      }
       var evLabel = (curNode.data('label') || '').replace(/\r?\n/g, ' ');
       // Extrai o sujeito: "EVALUATE WS-AUX" → "WS-AUX", "EVALUATE TRUE" → "TRUE"
       var evSubject = evLabel.replace(/^EVALUATE\s+/i, '').trim().toUpperCase();

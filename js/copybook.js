@@ -368,7 +368,7 @@ function bkParseCopybook(src) {
     // Palavras como NOTE, COMMENT, REMARK, nomes de campos NOT são stripadas —
     // serão tratadas como continuação ou ignoradas pelo baseMatch na fase de parse.
     let codeLine = trimmed;
-    if (!/^\d/.test(codeLine)) {
+    if (/^\d/.test(codeLine)) {
       const firstTok = codeLine.match(/^(\d+)\s+/);
       if (firstTok) {
         const stripped = codeLine.slice(firstTok[0].length).trim();
