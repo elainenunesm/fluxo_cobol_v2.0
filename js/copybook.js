@@ -3106,21 +3106,20 @@ function bkDataShowGroupKeyPicker() {
   let html = '<div class="bk-pop-title">&#128273; Campos-chave de agrupamento</div>';
   html += '<div style="font-size:11px;color:#aaa;margin-bottom:8px;padding:0 4px">Selecione os campos que formam o grupo. A cada mudança de valor, uma nova seção é criada.</div>';
   html += '<div style="max-height:300px;overflow-y:auto;padding:0 4px">';
-  baseCols.forEach((f, i) => {
+  baseCols.forEach(f => {
     html += `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:12px">` +
-      `<input type="checkbox" id="bk-grp-key-${i}" value="${f.name}" style="cursor:pointer">` +
+      `<input type="checkbox" class="bk-grp-key-cb" value="${f.name}" style="cursor:pointer">` +
       `<span style="font-family:monospace">${f.name}</span>` +
       `<span style="color:#666;font-size:10px">${f.pic || ''}</span>` +
       `</label>`;
   });
   html += '</div>';
   html += '<div style="margin-top:10px;display:flex;gap:8px;padding:4px">';
-  html += '<button class="bk-btn primary" style="flex:1" onclick="' +
-    'var kf=Array.from(document.querySelectorAll(\'[id^=\\\"bk-grp-key-\\\"]:checked\')).map(c=>c.value);' +
-    '_bkClosePopup();' +
-    'if(kf.length)bkDataExportXlsGrouped(kf);else alert(\'Selecione ao menos um campo.\')' +
+  html += '<button class="bk-dtb-btn bk-dtb-primary" style="flex:1;width:auto" onclick="' +
+    'var kf=Array.from(document.querySelectorAll(\'.bk-grp-key-cb:checked\')).map(c=>c.value);' +
+    'if(kf.length){_bkClosePopup();bkDataExportXlsGrouped(kf);}else alert(\'Selecione ao menos um campo.\')' +
     '">&#128229; Exportar</button>';
-  html += '<button class="bk-btn" onclick="_bkClosePopup()">Cancelar</button>';
+  html += '<button class="bk-dtb-btn" style="width:auto" onclick="_bkClosePopup()">Cancelar</button>';
   html += '</div>';
 
   pop.innerHTML = html;
