@@ -59,6 +59,7 @@ function fakeSimOpen() {
     },
     function onDone(paths) {
       _fakeSimPaths = paths;
+      _fakeSimPreloadAllData(); // garante ao menos 1 reg. em todos os arquivos/tabelas conhecidos
       _fakeSimRenderFilterBar();
       _fakeSimRenderPathList();
       // Avisa quando limite de caminhos foi atingido
@@ -68,6 +69,46 @@ function fakeSimOpen() {
       }
     }
   );
+}
+
+// ── Pré-carrega dados em TODOS os arquivos e tabelas com layout conhecido ──────────
+// Garante que a simulação tenha massa mesmo para arquivos/tabelas que só aparecem
+// em caminhos além do limite de 150, ou que não puderam ser associados a nenhum caminho.
+function _fakeSimPreloadAllData() {
+  // Arquivos FD
+  Object.keys(_simFiles || {}).forEach(function(fdName) {
+    var fd = _simFiles[fdName];
+    if (!fd || fd.isSD) return;
+    if (fd.records && fd.records.length > 0) return; // já tem dados
+    var effectiveFields = (fd.bookId && typeof _simGetBookFields === 'function')
+      ? (_simGetBookFields(fd.bookId) || fd.fields)
+      : fd.fields;
+    if (!effectiveFields.length) return;
+    fd.records = _fakeSimGenFileRecords(fdName, 3); // 3 = processa 2 + encontra AT END no 3º READ
+    fd.pointer = 0;
+  });
+  // Tabelas DB2
+  Object.keys(_simDb2Tables || {}).forEach(function(tblName) {
+    var tbl = _simDb2Tables[tblName];
+    if (!tbl) return;
+    if (tbl.rows && tbl.rows.length > 0) return; // já tem dados
+    // Mesmo fallback de _fakeSimInjectData para derivar colunas
+    if (!tbl.columns.length) {
+      if (tbl.selectMaps && tbl.selectMaps.length && tbl.selectMaps[0].into.length) {
+        tbl.columns = tbl.selectMaps[0].into.slice();
+      } else if (tbl.whereMaps && tbl.whereMaps.length) {
+        var wCols = [];
+        tbl.whereMaps.forEach(function(wm) {
+          Object.keys(wm).forEach(function(col) { if (wCols.indexOf(col) < 0) wCols.push(col); });
+        });
+        if (wCols.length) tbl.columns = wCols;
+      }
+    }
+    if (!tbl.columns.length) return;
+    // 3 linhas: garante que loops PERFORM/FETCH processem ao menos 2 registros
+    // e depois recebam SQLCODE=+100 (AT END) no 3º FETCH — condição correta de saída
+    tbl.rows = _fakeSimGenDb2Rows(tblName, 3);
+  });
 }
 
 function fakeSimClose() {
@@ -1308,10 +1349,32 @@ function _fakeSimInjectData(path) {
     // Pula somente se nenhum mecanismo conseguiu determinar colunas
     if (!tbl.columns.length) return;
     if (tbl.rows && tbl.rows.length > 0) return;
-    var isUsed = path.meta.sqlOps.some(function(op){ return op.toUpperCase().indexOf(tblName) >= 0; });
-    if (!isUsed && path.meta.sqlOps.length === 0) isUsed = true;
-    if (!isUsed) return;
-    var qty = path.meta.hitSqlError ? 0 : 2;
+    // Injeta em TODAS as tabelas com colunas conhecidas — necessário para que cursores
+    // (OPEN/FETCH) encontrem linhas mesmo que o nome da tabela não apareça literalmente
+    // em path.meta.sqlOps (que armazena o label do nó SQL, não o nome da tabela).
+    // Sem linhas, FETCH retorna SQLCODE=+100 inesperadamente, o flag de saída do loop
+    // nunca é setado pelo ramo forçado pelo fake-sim e o programa entra em loop infinito.
+    //
+    // Exceção: caminho de erro SQL (hitSqlError) → 0 linhas para disparar o erro real.
+    // Para hitSqlNotFound: injeta 0 linhas SOMENTE se a tabela for a referenciada
+    // diretamente em sqlOps (path de NOT FOUND esperado); caso contrário injeta 2
+    // para que cursores auxiliares funcionem.
+    var isDirectlyReferenced = path.meta.sqlOps.some(function(op){
+      return op.toUpperCase().indexOf(tblName) >= 0;
+    }) || Object.keys(_simDb2Cursors || {}).some(function(curName) {
+      return (_simDb2Cursors[curName].tableName || '').toUpperCase() === tblName.toUpperCase() &&
+             path.meta.sqlOps.some(function(op){ return op.toUpperCase().indexOf(curName.toUpperCase()) >= 0; });
+    });
+    var qty;
+    if (path.meta.hitSqlError) {
+      qty = 0; // caminho de erro: tabela vazia provoca o erro
+    } else if (path.meta.hitSqlNotFound && isDirectlyReferenced) {
+      qty = 0; // caminho NOT FOUND esperado para ESTA tabela
+    } else {
+      // Usa 3 linhas para caminhos com loop/cursor (PERFORM UNTIL FETCH AT END precisa
+      // de ao menos N linhas para iterar e depois receber o SQLCODE=+100 correto)
+      qty = (path.meta.enteredLoop || path.meta.sqlOps.some(function(op){ return /FETCH|OPEN/i.test(op); })) ? 3 : 2;
+    }
     tbl.rows = _fakeSimGenDb2Rows(tblName, qty);
     // Sincroniza colunas-chave do WHERE com as variáveis geradas para o caminho.
     // Resolve a cadeia de movimentações: se WS-CHAVE recebeu MOVE WS-COD TO WS-CHAVE,
@@ -1461,6 +1524,35 @@ function _fakeSimRenderDataPreview(path) {
       if (mode === 'io') {
         out += '<div class="fs-data-empty fs-data-io-note">⇄ Arquivo <b>entrada/saída</b> — os registros acima são a entrada; o programa também grava nele.</div>';
       }
+    });
+    out += '</div>';
+  }
+
+  // ── Arquivos pré-carregados mas não neste caminho ─────────────
+  // (existem no programa mas o caminho selecionado não os acessa — dados disponíveis para o simulador)
+  var extraFds = Object.keys(_simFiles || {}).filter(function(fdName) {
+    if (seen[fdName]) return false; // já foi mostrado acima
+    var fd = _simFiles[fdName];
+    if (!fd || fd.isSD) return false;
+    return fd.records && fd.records.length > 0;
+  });
+  if (extraFds.length) {
+    out += '<div class="fs-data-section fs-data-extra">';
+    out += '<div class="fs-data-sec-hdr fs-data-extra-hdr">📂 Outros arquivos pré-carregados <span class="fs-data-extra-note">(não neste caminho — disponíveis caso o simulador acesse)</span></div>';
+    extraFds.forEach(function(fdName) {
+      var fd = _simFiles[fdName];
+      var fields = (fd.bookId && typeof _simGetBookFields === 'function')
+        ? (_simGetBookFields(fd.bookId) || fd.fields)
+        : fd.fields;
+      if (!fields.length) return;
+      out += '<div class="fs-data-fd-name fs-data-extra-fd">' + _fsEsc(fdName) + ' <span class="fs-data-qty">' + fd.records.length + ' reg.</span></div>';
+      out += '<div class="fs-data-table-wrap"><table class="fs-data-table">';
+      out += '<thead><tr>' + fields.map(function(f){ return '<th>' + _fsEsc(f) + '</th>'; }).join('') + '</tr></thead>';
+      out += '<tbody>';
+      fd.records.forEach(function(r){
+        out += '<tr>' + fields.map(function(f){ var v = r[f] !== undefined ? r[f] : ''; return '<td>' + _fsEsc(v) + '</td>'; }).join('') + '</tr>';
+      });
+      out += '</tbody></table></div>';
     });
     out += '</div>';
   }

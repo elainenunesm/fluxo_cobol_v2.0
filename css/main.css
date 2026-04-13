@@ -6422,6 +6422,14 @@ body:not(.dark) .fs-fd-mode-sort { background: #ccfbf1; color: #0f766e; border-c
 .fs-data-sort-note { color: #5eead4 !important; }
 body:not(.dark) .fs-data-sort-note { color: #0f766e !important; }
 
+/* ── Arquivos pré-carregados (não no caminho selecionado) ─────── */
+.fs-data-extra        { border-color: #2a2a3a; opacity: .82; }
+.fs-data-extra-hdr    { color: #6b7280 !important; }
+.fs-data-extra-note   { font-size: 11px; font-weight: 400; color: #4b5563; }
+.fs-data-extra-fd     { color: #6b7280 !important; }
+.fs-data-extra .fs-data-table thead th { color: #4b5563; }
+.fs-data-extra .fs-data-table tbody tr { color: #6b7280; }
+
 /* Saída Antecipada — amarelo/âmbar, não verde */
 /* Sobrescreve qualquer herança de 'normal' */
 
