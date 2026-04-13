@@ -45,8 +45,11 @@ function _repEndRun(status) {
   _repCurrent.paraSeq  = (typeof _simParaSeq  !== 'undefined') ? _simParaSeq.slice() : [];
   _repScenarios.push(_repCurrent);
   _repCurrent = null;
-  // Garante que não armazena mais de 50 cenários (evita vazamento de memória)
-  if (_repScenarios.length > 50) _repScenarios.shift();
+  // Garante que não armazena mais de 100 cenários na navegação normal
+  // (em lote, fakeSimBatch controla temporariamente o limite via _fakeSimBatchOrigMaxScenarios)
+  var _repMaxSc = (typeof _fakeSimBatchOrigMaxScenarios !== 'undefined' && _fakeSimBatchOrigMaxScenarios > 50)
+    ? _fakeSimBatchOrigMaxScenarios : 100;
+  if (_repScenarios.length > _repMaxSc) _repScenarios.shift();
   // Atualiza badge de contagem no botão se modal já existir
   _repUpdateBadge();
 }
@@ -286,6 +289,8 @@ function _repBuildModalDOM() {
         '<div style="flex:1"></div>' +
         '<button class="rep-btn rep-btn-sec" onclick="_repExportJSON()" title="Exportar todos os cenários como JSON">&#8595; JSON</button>' +
         '<button class="rep-btn rep-btn-sec" onclick="_repExportTXT()"  title="Exportar relatório resumido como texto">&#8595; Texto</button>' +
+        '<button class="rep-btn rep-btn-sec rep-btn-html" onclick="_repExportHtml()" title="Exportar relatório completo como HTML com seções expansíveis">&#8595; HTML</button>' +
+        '<button class="rep-btn rep-btn-sec rep-btn-word" onclick="_repExportWord()" title="Exportar relatório completo para Word (RTF)">&#8595; Word</button>' +
         '<button class="rep-btn rep-btn-pri" onclick="_repCloseModal()">Fechar</button>' +
       '</div>' +
     '</div>';
@@ -671,6 +676,9 @@ function _repExsumSelectScenario(id) {
 
 // ── Aba: Cenários ────────────────────────────────────────────────
 
+// Modo de agrupamento da aba cenários: 'list' | 'bypath'
+var _repScenariosView = 'list';
+
 function _repRenderScenarios() {
   var pane = document.getElementById('rep-pane-scenarios');
   if (!pane) return;
@@ -680,26 +688,129 @@ function _repRenderScenarios() {
       '<div class="rep-empty">' +
         '<div class="rep-empty-icon">&#128202;</div>' +
         '<div>Nenhum cenário registrado ainda.</div>' +
-        '<div class="rep-empty-hint">Execute a simulação (▶) para gerar um cenário.</div>' +
+        '<div class="rep-empty-hint">Execute a simulação (▶) ou use <b>Executar Todos</b> (Fake Sim) para gerar cenários.</div>' +
       '</div>';
     return;
   }
 
-  var html = '<div class="rep-scenario-list">';
+  // Detecta se há dados de caminho para oferecer agrupamento
+  var hasBatchData = _repScenarios.some(function(s) { return s.fakePath; });
+  var view = hasBatchData ? _repScenariosView : 'list';
 
-  // Cenário em andamento (se houver)
-  if (_repCurrent) {
-    html += _repScenarioCard(_repCurrent, true);
+  // ── Toolbar de visualização ──
+  var toolbar = '<div class="rep-sc-toolbar">';
+  toolbar += '<span class="rep-sc-count">' + _repScenarios.length + ' cenário' + (_repScenarios.length > 1 ? 's' : '') + '</span>';
+  if (hasBatchData) {
+    toolbar += '<div class="rep-sc-view-btns">';
+    toolbar += '<button class="rep-btn rep-btn-xs' + (view === 'list'   ? ' rep-btn-active' : '') + '" onclick="_repSetScenariosView(\'list\')">&#9776; Lista</button>';
+    toolbar += '<button class="rep-btn rep-btn-xs' + (view === 'bypath' ? ' rep-btn-active' : '') + '" onclick="_repSetScenariosView(\'bypath\')">&#128200; Por Caminho</button>';
+    toolbar += '</div>';
+  }
+  toolbar += '</div>';
+
+  var html = toolbar;
+
+  if (view === 'bypath') {
+    html += _repRenderScenariosByPath();
+  } else {
+    html += '<div class="rep-scenario-list">';
+    if (_repCurrent) html += _repScenarioCard(_repCurrent, true);
+    _repScenarios.slice().reverse().forEach(function(sc) {
+      html += _repScenarioCard(sc, false);
+    });
+    html += '</div>';
   }
 
-  // Cenários concluídos (mais recente primeiro)
-  var rev = _repScenarios.slice().reverse();
-  rev.forEach(function(sc) {
-    html += _repScenarioCard(sc, false);
+  pane.innerHTML = html;
+}
+
+function _repSetScenariosView(v) {
+  _repScenariosView = v;
+  _repRenderScenarios();
+}
+
+/**
+ * Renderiza cenários agrupados por caminho (fakePath).
+ */
+function _repRenderScenariosByPath() {
+  // Agrupa cenários por fakePath.id; cenários sem fakePath ficam em grupo "Outros"
+  var groups = {};          // { pathId: { path, scenarios[] } }
+  var noPathScs = [];
+
+  _repScenarios.forEach(function(sc) {
+    if (sc.fakePath) {
+      var pid = sc.fakePath.id;
+      if (!groups[pid]) groups[pid] = { path: sc.fakePath, scenarios: [] };
+      groups[pid].scenarios.push(sc);
+    } else {
+      noPathScs.push(sc);
+    }
   });
 
+  var html = '<div class="rep-bypath-wrap">';
+
+  // Ordena pelos ids dos caminhos
+  var sortedKeys = Object.keys(groups).sort(function(a, b) { return Number(a) - Number(b); });
+
+  sortedKeys.forEach(function(pid) {
+    var grp = groups[pid];
+    var path = grp.path;
+    var scs  = grp.scenarios;
+
+    // Badges de categoria
+    var catBadges = (path.categories || []).map(function(c) {
+      var ci = (typeof _FS_CATEGORIES !== 'undefined' && _FS_CATEGORIES[c]) || null;
+      if (!ci) return '<span class="rep-path-cat-badge">' + _repEscHtml(c) + '</span>';
+      return '<span class="rep-path-cat-badge" style="border-color:' + ci.color + ';color:' + ci.color + '">' + ci.icon + '&nbsp;' + ci.label + '</span>';
+    }).join('');
+
+    // Status do caminho: pega o status do único cenário
+    var sc = scs[0];
+    var statusMap = { 'concluido': '✅ Concluído', 'interrompido': '⏸ Interrompido', 'cancelado': '❌ Cancelado' };
+    var stLbl = statusMap[sc.status] || sc.status;
+    var dur   = (sc.startTime && sc.endTime) ? ((sc.endTime - sc.startTime) / 1000).toFixed(2) + 's' : '--';
+
+    html += '<div class="rep-path-group" id="rep-pg-' + pid + '">';
+    html += '<div class="rep-path-group-hdr" onclick="_repTogglePathGroup(' + pid + ')">';
+    html += '<span class="rep-path-group-num">Caminho ' + pid + '</span>';
+    html += '<span class="rep-path-group-cats">' + catBadges + '</span>';
+    html += '<span class="rep-path-group-status">' + stLbl + '</span>';
+    html += '<span class="rep-path-group-meta">' + sc.steps + ' passos &middot; ' + dur + '</span>';
+    html += '<span class="rep-path-group-arrow" id="rep-pg-arr-' + pid + '">&#9654;</span>';
+    html += '</div>';
+    html += '<div class="rep-path-group-body rep-path-group-body--hidden" id="rep-pg-body-' + pid + '">';
+    scs.forEach(function(s) {
+      html += _repScenarioCard(s, false);
+    });
+    html += '</div>';
+    html += '</div>';
+  });
+
+  // Cenários sem caminho (executados manualmente)
+  if (noPathScs.length > 0) {
+    html += '<div class="rep-path-group">';
+    html += '<div class="rep-path-group-hdr rep-path-group-hdr--other">';
+    html += '<span class="rep-path-group-num">Execuções manuais</span>';
+    html += '<span class="rep-path-group-meta">' + noPathScs.length + ' cenário(s)</span>';
+    html += '</div>';
+    html += '<div class="rep-path-group-body">';
+    noPathScs.slice().reverse().forEach(function(s) {
+      html += _repScenarioCard(s, false);
+    });
+    html += '</div>';
+    html += '</div>';
+  }
+
   html += '</div>';
-  pane.innerHTML = html;
+  return html;
+}
+
+function _repTogglePathGroup(pid) {
+  var body = document.getElementById('rep-pg-body-' + pid);
+  var arr  = document.getElementById('rep-pg-arr-'  + pid);
+  if (!body) return;
+  var hidden = body.classList.toggle('rep-path-group-body--hidden');
+  if (arr) arr.innerHTML = hidden ? '&#9654;' : '&#9660;';
 }
 
 function _repScenarioCard(sc, isLive) {
@@ -714,9 +825,20 @@ function _repScenarioCard(sc, isLive) {
   var isExpanded = (_repActiveScenario === sc.id);
   var uniqueNodes = Object.keys(sc.nodesVisitedSet).length;
 
+  // Badge do caminho fake, se disponível
+  var pathBadge = '';
+  if (sc.fakePath) {
+    var catIcons = (sc.fakePath.categories || []).map(function(c) {
+      var ci = (typeof _FS_CATEGORIES !== 'undefined' && _FS_CATEGORIES[c]) || null;
+      return ci ? ci.icon : c;
+    }).join(' ');
+    pathBadge = '<span class="rep-sc-path-badge" title="Caminho ' + sc.fakePath.id + '">&#128200; C' + sc.fakePath.id + ' ' + catIcons + '</span>';
+  }
+
   var html = '<div class="rep-sc-card' + (isLive ? ' rep-sc-live' : '') + '" id="rep-sc-' + sc.id + '">';
   html += '<div class="rep-sc-header" onclick="_repToggleScenario(' + sc.id + ')">';
   html += '<span class="rep-sc-num">#' + sc.id + '</span>';
+  if (pathBadge) html += pathBadge;
   html += '<span class="rep-sc-status ' + statusCls + '">' + lbl + '</span>';
   html += '<span class="rep-sc-meta">' + tStart + ' → ' + tEnd + ' (' + dur + ')</span>';
   html += '<span class="rep-sc-kpi"><b>' + sc.steps + '</b> passos &nbsp; <b>' + uniqueNodes + '</b> nós únicos &nbsp; <b>' + sc.branches.length + '</b> ramos</span>';
@@ -1211,6 +1333,460 @@ function _repExportTXT() {
     lines.push('-'.repeat(60));
   });
   _repDownload('cobol-flow-relatorio.txt', lines.join('\n'), 'text/plain');
+}
+
+// ── Exportação HTML (seções colapsáveis) ─────────────────────────
+
+function _repExportHtml() {
+  if (_repScenarios.length === 0) { alert('Nenhum cenário para exportar.'); return; }
+  var prog = _repDetectProgramName ? _repDetectProgramName() : 'PROGRAMA';
+  var date = new Date().toLocaleString('pt-BR');
+  var totalScenarios = _repScenarios.length;
+
+  // Agrega estatísticas gerais
+  var totalSteps    = _repScenarios.reduce(function(a,s){ return a + s.steps; }, 0);
+  var totalBranches = _repScenarios.reduce(function(a,s){ return a + s.branches.length; }, 0);
+  var totalVarsChg  = _repScenarios.reduce(function(a,s){ return a + s.varsChanged.length; }, 0);
+
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // Gera HTML de uma seção colapsável
+  function section(id, icon, title, contentHtml, openByDefault) {
+    var open = openByDefault ? ' open' : '';
+    return '<details class="rep-sec"' + open + ' id="sec-' + id + '">' +
+      '<summary class="rep-sec-summary">' +
+        '<span class="rep-sec-icon">' + icon + '</span>' +
+        '<span class="rep-sec-title">' + esc(title) + '</span>' +
+        '<span class="rep-sec-chevron">&#9654;</span>' +
+      '</summary>' +
+      '<div class="rep-sec-body">' + contentHtml + '</div>' +
+    '</details>';
+  }
+
+  function kpiRow(items) {
+    var h = '<div class="rep-kpi-row">';
+    items.forEach(function(item) {
+      h += '<div class="rep-kpi"><div class="rep-kpi-val">' + esc(String(item.v)) + '</div><div class="rep-kpi-lbl">' + esc(item.l) + '</div></div>';
+    });
+    return h + '</div>';
+  }
+
+  function table(headers, rows) {
+    var h = '<table class="rep-table"><thead><tr>';
+    headers.forEach(function(th) { h += '<th>' + esc(th) + '</th>'; });
+    h += '</tr></thead><tbody>';
+    rows.forEach(function(row) {
+      h += '<tr>';
+      row.forEach(function(td, i) { h += '<td' + (i > 0 ? ' class="rep-td-num"' : '') + '>' + esc(String(td)) + '</td>'; });
+      h += '</tr>';
+    });
+    return h + '</tbody></table>';
+  }
+
+  // ── Seção: Visão Geral ──
+  var overviewHtml = kpiRow([
+    { l: 'Cenários', v: totalScenarios },
+    { l: 'Passos totais', v: totalSteps },
+    { l: 'Desvios', v: totalBranches },
+    { l: 'Vars alteradas', v: totalVarsChg }
+  ]);
+
+  // Top nós visitados
+  var nodeCount = {};
+  _repScenarios.forEach(function(sc) {
+    sc.nodesVisited.forEach(function(n) {
+      nodeCount[n.label] = (nodeCount[n.label] || 0) + 1;
+    });
+  });
+  var topNodes = Object.keys(nodeCount)
+    .map(function(k){ return { l: k, c: nodeCount[k] }; })
+    .sort(function(a,b){ return b.c - a.c; }).slice(0, 15);
+  if (topNodes.length > 0) {
+    overviewHtml += '<div class="rep-section-title">Nós mais executados (top 15)</div>';
+    var maxC = topNodes[0].c;
+    overviewHtml += '<div class="rep-bar-list">';
+    topNodes.forEach(function(n, i) {
+      var pct = maxC > 0 ? Math.round((n.c / maxC) * 100) : 0;
+      overviewHtml += '<div class="rep-bar-row"><span class="rep-bar-rank">' + (i+1) + '</span>' +
+        '<span class="rep-bar-lbl" title="' + esc(n.l) + '">' + esc(n.l.substring(0,40)) + '</span>' +
+        '<span class="rep-bar-track"><span class="rep-bar-fill" style="width:' + pct + '%"></span></span>' +
+        '<span class="rep-bar-val">' + n.c + '</span></div>';
+    });
+    overviewHtml += '</div>';
+  }
+
+  // ── Seção: Cenários ──
+  var hasBatchDataHtml = _repScenarios.some(function(s) { return s.fakePath; });
+  var scenariosHtml = '';
+
+  function _scCardHtml(sc) {
+    var dur = (sc.startTime && sc.endTime) ? ((sc.endTime - sc.startTime) / 1000).toFixed(2) + 's' : '--';
+    var statusMap = { 'concluido': '✅ Concluído', 'interrompido': '⏸ Interrompido', 'cancelado': '❌ Cancelado', 'em-andamento': '▶ Em andamento' };
+    var scHtml = '<div class="rep-sc-meta">';
+    scHtml += '<span class="rep-sc-status">' + esc(statusMap[sc.status] || sc.status) + '</span>';
+    scHtml += '<span>Início: ' + esc(sc.startTime ? sc.startTime.toLocaleString('pt-BR') : '--') + '</span>';
+    scHtml += '<span>Duração: ' + esc(dur) + '</span>';
+    scHtml += '</div>';
+    scHtml += kpiRow([
+      { l: 'Passos', v: sc.steps },
+      { l: 'Nós únicos', v: Object.keys(sc.nodesVisitedSet).length },
+      { l: 'Desvios', v: sc.branches.length },
+      { l: 'Loops', v: sc.loops.length },
+      { l: 'Iters loop', v: sc.totalLoopIterations },
+      { l: 'Vars alteradas', v: sc.varsChanged.length }
+    ]);
+    var paraKeys = Object.keys(sc.paragraphs);
+    if (paraKeys.length > 0) {
+      scHtml += '<div class="rep-section-title">Parágrafos executados</div><div class="rep-para-wrap">';
+      paraKeys.sort(function(a,b){ return sc.paragraphs[b]-sc.paragraphs[a]; }).forEach(function(p) {
+        scHtml += '<span class="rep-para-badge">' + esc(p) + ' <sup>' + sc.paragraphs[p] + 'x</sup></span>';
+      });
+      scHtml += '</div>';
+    }
+    if (sc.branches.length > 0) {
+      scHtml += '<div class="rep-section-title">Desvios</div>';
+      scHtml += table(['Passo','Condição','Resultado','Modo'],
+        sc.branches.slice(0,30).map(function(b){ return [b.step, b.condition.substring(0,60), b.result, b.wasAuto?'AUTO':'MANUAL']; }));
+    }
+    if (sc.varsChanged.length > 0) {
+      var varMap = {};
+      sc.varsChanged.forEach(function(v){ varMap[v.name] = v; });
+      scHtml += '<div class="rep-section-title">Variáveis — valores finais</div>';
+      scHtml += table(['Variável','De','Para','Passo'],
+        Object.values(varMap).slice(0,20).map(function(v){ return [v.name, v.from, v.to, v.step]; }));
+    }
+    var fdNames = Object.keys(sc.fileOps);
+    if (fdNames.length > 0) {
+      scHtml += '<div class="rep-section-title">Operações em arquivos</div>';
+      scHtml += table(['Arquivo','Opens','Reads','Writes','Closes'],
+        fdNames.map(function(fd){ var fo=sc.fileOps[fd]; return [fd,fo.opens,fo.reads,fo.writes,fo.closes]; }));
+    }
+    if (sc.log.length > 0) {
+      scHtml += '<div class="rep-section-title">Log (' + sc.log.length + ' linhas)</div><div class="rep-log-mini">';
+      sc.log.forEach(function(l) {
+        scHtml += '<div class="rep-log-line rep-log-type-' + esc(l.type||'step') + '">' +
+          '<span class="rep-log-time">' + esc(l.time||'') + '</span> ' + esc(l.text) + '</div>';
+      });
+      scHtml += '</div>';
+    }
+    return scHtml;
+  }
+
+  if (hasBatchDataHtml) {
+    // Agrupa por caminho
+    var htmlGroups = {};
+    var htmlNoPath = [];
+    _repScenarios.forEach(function(sc) {
+      if (sc.fakePath) {
+        var pid = sc.fakePath.id;
+        if (!htmlGroups[pid]) htmlGroups[pid] = { path: sc.fakePath, items: [] };
+        htmlGroups[pid].items.push(sc);
+      } else {
+        htmlNoPath.push(sc);
+      }
+    });
+    Object.keys(htmlGroups).sort(function(a,b){ return Number(a)-Number(b); }).forEach(function(pid) {
+      var grp  = htmlGroups[pid];
+      var cats = (grp.path.categories || []).map(function(c) {
+        var ci = (typeof _FS_CATEGORIES !== 'undefined' && _FS_CATEGORIES[c]) || null;
+        return ci ? ci.icon + ' ' + ci.label : c;
+      }).join(' | ');
+      var innerHtml = '';
+      grp.items.forEach(function(sc) {
+        var dur = (sc.startTime && sc.endTime) ? ((sc.endTime - sc.startTime) / 1000).toFixed(2) + 's' : '--';
+        var statusMap = { 'concluido': '✅', 'interrompido': '⏸', 'cancelado': '❌' };
+        innerHtml += section('sc-' + sc.id, '📄',
+          'Cenário #' + sc.id + ' — ' + (statusMap[sc.status]||sc.status) + ' (' + sc.steps + ' passos, ' + dur + ')',
+          _scCardHtml(sc), false);
+      });
+      scenariosHtml += section('path-' + pid, '📁',
+        'Caminho ' + pid + ' — ' + esc(cats), innerHtml, false);
+    });
+    if (htmlNoPath.length > 0) {
+      var noPathInner = '';
+      htmlNoPath.slice().reverse().forEach(function(sc) {
+        var dur = (sc.startTime && sc.endTime) ? ((sc.endTime - sc.startTime) / 1000).toFixed(2) + 's' : '--';
+        var statusMap = { 'concluido': '✅', 'interrompido': '⏸', 'cancelado': '❌' };
+        noPathInner += section('sc-' + sc.id, '📄',
+          'Cenário #' + sc.id + ' (' + sc.steps + ' passos, ' + dur + ')',
+          _scCardHtml(sc), false);
+      });
+      scenariosHtml += section('path-manual', '🖊', 'Execuções manuais', noPathInner, false);
+    }
+  } else {
+    _repScenarios.slice().reverse().forEach(function(sc) {
+      var dur = (sc.startTime && sc.endTime) ? ((sc.endTime - sc.startTime) / 1000).toFixed(2) + 's' : '--';
+      var statusMap = { 'concluido': '✅ Concluído', 'interrompido': '⏸ Interrompido', 'cancelado': '❌ Cancelado', 'em-andamento': '▶ Em andamento' };
+      scenariosHtml += section('sc-' + sc.id, '📁',
+        'Cenário #' + sc.id + ' — ' + (statusMap[sc.status]||sc.status) + ' (' + sc.steps + ' passos, ' + dur + ')',
+        _scCardHtml(sc), sc === _repScenarios[_repScenarios.length-1]);
+    });
+  }
+
+  // ── Seção: Estatísticas ──
+  var all = _repScenarios;
+  var allStepsArr = all.map(function(s){ return s.steps; });
+  var avgSteps = allStepsArr.length ? (allStepsArr.reduce(function(a,b){return a+b;},0)/allStepsArr.length).toFixed(1) : '--';
+  var varCount = {};
+  all.forEach(function(sc){ sc.varsChanged.forEach(function(v){ varCount[v.name]=(varCount[v.name]||0)+1; }); });
+  var topVars = Object.keys(varCount).map(function(k){ return {n:k,c:varCount[k]}; }).sort(function(a,b){return b.c-a.c;}).slice(0,20);
+  var statsHtml = kpiRow([
+    { l: 'Cenários', v: all.length },
+    { l: 'Média passos', v: avgSteps },
+    { l: 'Total desvios', v: all.reduce(function(a,s){return a+s.branches.length;},0) },
+    { l: 'Total iters loop', v: all.reduce(function(a,s){return a+s.totalLoopIterations;},0) }
+  ]);
+  if (topVars.length > 0) {
+    statsHtml += '<div class="rep-section-title">Variáveis mais alteradas</div><div class="rep-bar-list">';
+    var maxVC = topVars[0].c;
+    topVars.forEach(function(v, i) {
+      var pct = maxVC > 0 ? Math.round((v.c / maxVC) * 100) : 0;
+      statsHtml += '<div class="rep-bar-row"><span class="rep-bar-rank">' + (i+1) + '</span>' +
+        '<span class="rep-bar-lbl rep-td-var">' + esc(v.n) + '</span>' +
+        '<span class="rep-bar-track"><span class="rep-bar-fill rep-bar-fill-var" style="width:' + pct + '%"></span></span>' +
+        '<span class="rep-bar-val">' + v.c + '</span></div>';
+    });
+    statsHtml += '</div>';
+  }
+
+  // ── Seção: Log completo ──
+  var logHtml = '<div class="rep-log-mini">';
+  _repScenarios.forEach(function(sc) {
+    logHtml += '<div class="rep-log-header">══ Cenário #' + sc.id + ' — ' + esc(sc.status.toUpperCase()) + ' ══</div>';
+    sc.log.forEach(function(l) {
+      logHtml += '<div class="rep-log-line rep-log-type-' + esc(l.type||'step') + '">' +
+        '<span class="rep-log-time">' + esc(l.time||'') + '</span> ' + esc(l.text) + '</div>';
+    });
+  });
+  logHtml += '</div>';
+
+  // ── Estilos inline ──
+  var css = [
+    '*{box-sizing:border-box;margin:0;padding:0}',
+    'body{background:#fff;color:#1f2937;font-family:"Segoe UI",Arial,sans-serif;padding:24px 32px;font-size:13px}',
+    'h1{font-size:18px;font-weight:700;color:#3730a3;margin-bottom:4px}',
+    '.meta{font-size:11px;color:#6b7280;margin-bottom:20px}',
+    '.toggle-all{display:flex;gap:8px;margin-bottom:12px}',
+    '.toggle-all button{font-size:11px;padding:3px 12px;border-radius:5px;border:1px solid #d0d7de;background:#f6f8fa;color:#24292f;cursor:pointer}',
+    '.toggle-all button:hover{background:#eaeef2}',
+    '.rep-sec{border:1px solid #e5e7eb;border-radius:10px;margin-bottom:12px;overflow:hidden}',
+    '.rep-sec-summary{display:flex;align-items:center;gap:8px;padding:12px 16px;cursor:pointer;list-style:none;background:#f9fafb;user-select:none}',
+    '.rep-sec-summary:hover{background:#f0f4ff}',
+    '.rep-sec-icon{font-size:16px}',
+    '.rep-sec-title{flex:1;font-size:13px;font-weight:600;color:#374151}',
+    '.rep-sec-chevron{font-size:11px;color:#6b7280;transition:transform .2s}',
+    '.rep-sec[open] .rep-sec-chevron{transform:rotate(90deg)}',
+    '.rep-sec-body{padding:14px 16px;display:flex;flex-direction:column;gap:10px}',
+    '.rep-section-title{font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-top:8px;margin-bottom:4px;padding-bottom:4px;border-bottom:1px solid #e5e7eb}',
+    '.rep-kpi-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px}',
+    '.rep-kpi{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 16px;min-width:80px;text-align:center}',
+    '.rep-kpi-val{font-size:20px;font-weight:700;color:#3730a3}',
+    '.rep-kpi-lbl{font-size:10px;color:#6b7280}',
+    '.rep-table{width:100%;border-collapse:collapse;font-size:11px}',
+    '.rep-table th{background:#f1f5f9;color:#374151;padding:5px 10px;text-align:left;font-weight:600;border-bottom:2px solid #e2e8f0}',
+    '.rep-table td{padding:4px 10px;border-bottom:1px solid #f1f5f9;color:#1f2937}',
+    '.rep-table tr:hover td{background:#f8fafc}',
+    '.rep-td-num{text-align:center;font-variant-numeric:tabular-nums;color:#4338ca;font-weight:600}',
+    '.rep-bar-list{display:flex;flex-direction:column;gap:3px}',
+    '.rep-bar-row{display:flex;align-items:center;gap:6px;font-size:11px}',
+    '.rep-bar-rank{width:22px;text-align:right;color:#9ca3af;font-size:10px}',
+    '.rep-bar-lbl{width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#374151}',
+    '.rep-td-var{color:#0e7490;font-family:monospace}',
+    '.rep-bar-track{flex:1;background:#e5e7eb;border-radius:4px;height:8px;overflow:hidden}',
+    '.rep-bar-fill{height:100%;background:#4338ca;border-radius:4px}',
+    '.rep-bar-fill-var{background:#0e7490}',
+    '.rep-bar-val{width:30px;text-align:right;font-weight:600;color:#3730a3;font-size:11px}',
+    '.rep-sc-meta{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:#6b7280;margin-bottom:8px}',
+    '.rep-sc-status{font-weight:700;color:#15803d}',
+    '.rep-para-wrap{display:flex;flex-wrap:wrap;gap:5px}',
+    '.rep-para-badge{background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:2px 9px;font-size:11px;color:#1d4ed8}',
+    '.rep-log-mini{background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:8px 10px;font-family:monospace;font-size:11px;max-height:320px;overflow-y:auto}',
+    '.rep-log-header{font-weight:700;color:#3730a3;padding:4px 0;border-top:1px solid #e5e7eb;margin-top:4px}',
+    '.rep-log-header:first-child{border-top:none;margin-top:0}',
+    '.rep-log-line{padding:1px 0;color:#1f2937}',
+    '.rep-log-type-var{color:#0e7490}',
+    '.rep-log-type-file{color:#047857}',
+    '.rep-log-type-file-var{color:#065f46;padding-left:12px}',
+    '.rep-log-type-branch{color:#b45309}',
+    '.rep-log-type-loop{color:#6d28d9}',
+    '.rep-log-time{color:#9ca3af;font-size:10px;margin-right:4px}'
+  ].join('\n');
+
+  var html = '<!DOCTYPE html>\n<html lang="pt-BR">\n<head>\n<meta charset="UTF-8">\n' +
+    '<title>Relatório de Investigação — ' + esc(prog) + '</title>\n' +
+    '<style>' + css + '</style>\n</head>\n<body>\n' +
+    '<h1>📋 Relatório de Investigação — ' + esc(prog) + '</h1>\n' +
+    '<div class="meta">Gerado em ' + esc(date) + ' &nbsp;·&nbsp; COBOL Flow &nbsp;·&nbsp; ' + totalScenarios + ' cenário(s)</div>\n' +
+    '<div class="toggle-all">' +
+      '<button onclick="document.querySelectorAll(\'.rep-sec\').forEach(function(d){d.open=true})">⊞ Expandir tudo</button>' +
+      '<button onclick="document.querySelectorAll(\'.rep-sec\').forEach(function(d){d.open=false})">⊟ Recolher tudo</button>' +
+    '</div>\n' +
+    section('overview',  '🌐', 'Visão Geral',    overviewHtml,  true)  + '\n' +
+    section('scenarios', '📁', 'Cenários (' + totalScenarios + ')', scenariosHtml, true) + '\n' +
+    section('stats',     '📊', 'Estatísticas',   statsHtml,     false) + '\n' +
+    section('log',       '📜', 'Log Completo',   logHtml,       false) + '\n' +
+    '</body>\n</html>';
+
+  _repDownload(prog + '_investigacao.html', html, 'text/html;charset=utf-8');
+}
+
+// ── Exportação Word / RTF (seções com marcadores) ────────────────
+
+function _repExportWord() {
+  if (_repScenarios.length === 0) { alert('Nenhum cenário para exportar.'); return; }
+  var prog = _repDetectProgramName ? _repDetectProgramName() : 'PROGRAMA';
+  var date = new Date().toLocaleString('pt-BR');
+
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .replace(/\\/g, '\\\\')
+      .replace(/\{/g, '\\{')
+      .replace(/\}/g, '\\}')
+      .replace(/[^\x00-\x7F]/g, function(c){ return '\\u' + c.charCodeAt(0) + '?'; });
+  }
+
+  // cf1=#1f2937(default) cf2=#3730a3(title) cf3=#15803d(ok/success) cf4=#dc2626(error/stop)
+  // cf5=#6b7280(meta)   cf6=#4338ca(number/kpi) cf7=#b45309(branch/warn) cf8=#0e7490(var)
+  // cf9=#9ca3af(sep)    cf10=#047857(file)   cf11=#6d28d9(loop)   cf12=#6b7280(detail)
+  var colortbl = '{\\colortbl;\\red31\\green41\\blue55;\\red55\\green48\\blue163;\\red21\\green128\\blue61;' +
+    '\\red220\\green38\\blue38;\\red107\\green114\\blue128;\\red67\\green56\\blue202;\\red179\\green83\\blue14;' +
+    '\\red14\\green116\\blue144;\\red156\\green163\\blue175;\\red4\\green120\\blue87;\\red109\\green40\\blue217;\\red107\\green114\\blue128;}';
+
+  var lines = [
+    '{\\rtf1\\ansi\\ansicpg1252\\deff0',
+    '{\\fonttbl{\\f0\\fmodern\\fcharset0 Courier New;}{\\f1\\fswiss\\fcharset0 Segoe UI;}}',
+    colortbl,
+    '\\widowctrl\\wpaper12240\\wpapr15840\\margl1440\\margr1440\\margt1440\\margb1440',
+    '\\f1\\fs28\\b\\cf2 ' + esc('RELATÓRIO DE INVESTIGAÇÃO — ' + prog) + '\\b0\\par',
+    '\\fs18\\cf5 ' + esc('Gerado em ' + date + ' · COBOL Flow · ' + _repScenarios.length + ' cenário(s)') + '\\par\\par'
+  ];
+
+  function secTitle(t) {
+    return '\\f1\\fs22\\b\\cf2 ' + esc(t) + '\\b0\\f0\\par';
+  }
+  function subTitle(t) {
+    return '\\f1\\fs18\\b\\cf6 ' + esc(t) + '\\b0\\par';
+  }
+  function sep() {
+    return '\\cf9\\fs16 ' + esc('─'.repeat(70)) + '\\par';
+  }
+  function kpiLine(label, value) {
+    return '\\f1\\fs18\\cf5 ' + esc(label + ':') + ' \\b\\cf6 ' + esc(String(value)) + '\\b0\\par';
+  }
+  function logLine(l) {
+    var clrMap = { 'step':'\\cf1','var':'\\cf8','file':'\\cf10','file-var':'\\cf10','branch':'\\cf7','loop':'\\cf11' };
+    var clr = clrMap[l.type||'step'] || '\\cf1';
+    return '\\f0\\fs16' + clr + ' ' + esc((l.time?l.time+' ':'')+l.text) + '\\par';
+  }
+
+  // ── Visão Geral ──
+  lines.push(sep());
+  lines.push(secTitle('VISÃO GERAL'));
+  lines.push(sep());
+  lines.push(kpiLine('Cenários', _repScenarios.length));
+  lines.push(kpiLine('Total de passos', _repScenarios.reduce(function(a,s){ return a+s.steps; },0)));
+  lines.push(kpiLine('Total de desvios', _repScenarios.reduce(function(a,s){ return a+s.branches.length; },0)));
+  lines.push(kpiLine('Variáveis alteradas', _repScenarios.reduce(function(a,s){ return a+s.varsChanged.length; },0)));
+  lines.push('\\par');
+
+  // ── Cenários (agrupados por caminho se disponível) ──
+  lines.push(sep());
+  lines.push(secTitle('CENÁRIOS'));
+
+  var hasBatchWord = _repScenarios.some(function(s) { return s.fakePath; });
+
+  function _wordScBlock(sc) {
+    var dur = (sc.startTime && sc.endTime) ? ((sc.endTime - sc.startTime) / 1000).toFixed(2) + 's' : '--';
+    lines.push(sep());
+    lines.push(subTitle('Cenário #' + sc.id + ' — ' + sc.status.toUpperCase() + ' (' + sc.steps + ' passos, ' + dur + ')'));
+    lines.push(kpiLine('Início', sc.startTime ? sc.startTime.toLocaleString('pt-BR') : '--'));
+    lines.push(kpiLine('Nós únicos', Object.keys(sc.nodesVisitedSet).length));
+    lines.push(kpiLine('Desvios', sc.branches.length + ' (auto:' + sc.autoResolvedBranches + ' manual:' + sc.manualBranches + ')'));
+    lines.push(kpiLine('Loops', sc.loops.length + ' (' + sc.totalLoopIterations + ' iters)'));
+    lines.push(kpiLine('Variáveis alteradas', sc.varsChanged.length));
+    var paraKeys = Object.keys(sc.paragraphs);
+    if (paraKeys.length > 0) {
+      lines.push('\\f1\\fs16\\b\\cf5 Par\u00e1grafos executados: \\b0\\cf1 ' + esc(paraKeys.slice(0,20).join(', ')) + (paraKeys.length>20?' ...':'') + '\\par');
+    }
+    if (sc.branches.length > 0) {
+      lines.push('\\f1\\fs16\\b\\cf7 Desvios:\\b0\\par');
+      sc.branches.slice(0,20).forEach(function(b) {
+        lines.push('\\f0\\fs15\\cf7   [passo ' + esc(String(b.step)) + '] ' + esc(b.condition.substring(0,60)) + ' \\b\\u8594? ' + esc(b.result) + '\\b0 (' + (b.wasAuto?'auto':'manual') + ')\\par');
+      });
+      if (sc.branches.length > 20) lines.push('\\cf5\\fs15\\i   ... mais ' + (sc.branches.length-20) + ' desvios\\i0\\par');
+    }
+    if (sc.varsChanged.length > 0) {
+      var varMap = {};
+      sc.varsChanged.forEach(function(v){ varMap[v.name]=v; });
+      lines.push('\\f1\\fs16\\b\\cf8 Vari\u00e1veis \u2014 valores finais:\\b0\\par');
+      Object.values(varMap).slice(0,20).forEach(function(v) {
+        lines.push('\\f0\\fs15\\cf8   ' + esc(v.name) + ' \\cf5[' + esc(v.from) + '] \\u8594? \\b[' + esc(v.to) + ']\\b0\\par');
+      });
+    }
+    var fdNms = Object.keys(sc.fileOps);
+    if (fdNms.length > 0) {
+      lines.push('\\f1\\fs16\\b\\cf10 Opera\u00e7\u00f5es em arquivos:\\b0\\par');
+      fdNms.forEach(function(fd) {
+        var fo = sc.fileOps[fd];
+        lines.push('\\f0\\fs15\\cf10   ' + esc(fd) + ' \\cf5\u2014 opens:' + fo.opens + ' reads:' + fo.reads + ' writes:' + fo.writes + ' closes:' + fo.closes + '\\par');
+      });
+    }
+    if (sc.log.length > 0) {
+      lines.push('\\f1\\fs16\\b\\cf5 Log deste cen\u00e1rio (' + sc.log.length + ' linhas):\\b0\\par');
+      sc.log.slice(0,60).forEach(function(l){ lines.push(logLine(l)); });
+      if (sc.log.length > 60) lines.push('\\cf5\\fs15\\i   ... mais ' + (sc.log.length-60) + ' linhas\\i0\\par');
+    }
+    lines.push('\\par');
+  }
+
+  if (hasBatchWord) {
+    var wordGroups = {};
+    var wordNoPath = [];
+    _repScenarios.forEach(function(sc) {
+      if (sc.fakePath) {
+        var pid = sc.fakePath.id;
+        if (!wordGroups[pid]) wordGroups[pid] = { path: sc.fakePath, items: [] };
+        wordGroups[pid].items.push(sc);
+      } else { wordNoPath.push(sc); }
+    });
+    Object.keys(wordGroups).sort(function(a,b){ return Number(a)-Number(b); }).forEach(function(pid) {
+      var grp  = wordGroups[pid];
+      var cats = (grp.path.categories || []).map(function(c) {
+        var ci = (typeof _FS_CATEGORIES !== 'undefined' && _FS_CATEGORIES[c]) || null;
+        return ci ? ci.icon + ' ' + ci.label : c;
+      }).join(' | ');
+      lines.push('\\f1\\fs24\\b\\cf2 Caminho ' + esc(String(pid)) + ' \u2014 ' + esc(cats) + '\\b0\\par');
+      grp.items.forEach(function(sc) { _wordScBlock(sc); });
+    });
+    if (wordNoPath.length > 0) {
+      lines.push('\\f1\\fs22\\b\\cf5 Execu\u00e7\u00f5es manuais\\b0\\par');
+      wordNoPath.slice().reverse().forEach(function(sc) { _wordScBlock(sc); });
+    }
+  } else {
+    _repScenarios.slice().reverse().forEach(function(sc) { _wordScBlock(sc); });
+  }
+
+  // ── Estatísticas ──
+  lines.push(sep());
+  lines.push(secTitle('ESTATÍSTICAS AGREGADAS'));
+  lines.push(sep());
+  var allSteps2 = _repScenarios.map(function(s){ return s.steps; });
+  lines.push(kpiLine('Média de passos', (allSteps2.reduce(function(a,b){return a+b;},0)/allSteps2.length).toFixed(1)));
+  lines.push(kpiLine('Máx. passos', Math.max.apply(null,allSteps2)));
+  lines.push(kpiLine('Mín. passos', Math.min.apply(null,allSteps2)));
+  var varCount2 = {};
+  _repScenarios.forEach(function(sc){ sc.varsChanged.forEach(function(v){ varCount2[v.name]=(varCount2[v.name]||0)+1; }); });
+  var topVars2 = Object.keys(varCount2).map(function(k){ return {n:k,c:varCount2[k]}; }).sort(function(a,b){return b.c-a.c;}).slice(0,15);
+  if (topVars2.length > 0) {
+    lines.push('\\f1\\fs18\\b\\cf8 Variáveis mais alteradas:\\b0\\par');
+    topVars2.forEach(function(v,i){ lines.push('\\f0\\fs15\\cf8   ' + (i+1) + '. ' + esc(v.n) + ' \\cf5(' + v.c + 'x)\\par'); });
+  }
+  lines.push('\\par}');
+
+  _repDownload(prog + '_investigacao.rtf', lines.join('\n'), 'application/rtf');
 }
 
 // ── Utilidades ────────────────────────────────────────────────────

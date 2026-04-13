@@ -180,7 +180,12 @@
       <button class="ribbon-btn" id="btn-simular" onclick="simOpen()" title="Simular execu&#231;&#227;o COBOL passo a passo" style="border-color:#4f46e5;color:#4f46e5;">
         <span class="ribbon-btn-icon">&#127381;</span>
         <span class="ribbon-btn-label">Simular</span>
-      </button>      <button class="ribbon-btn" id="btn-relatorio" onclick="repOpenModal()" title="Relatório de Investigação" style="border-color:#0891b2;color:#0891b2;">
+      </button>
+      <button class="ribbon-btn ribbon-btn-fakesim" id="btn-fakesim" onclick="fakeSimOpen()" title="Simulação Fake — gera todos os caminhos possíveis automaticamente" style="border-color:#d97706;color:#d97706;">
+        <span class="ribbon-btn-icon">&#127921;</span>
+        <span class="ribbon-btn-label">Fake<br>Sim</span>
+      </button>
+      <button class="ribbon-btn" id="btn-relatorio" onclick="repOpenModal()" title="Relatório de Investigação" style="border-color:#0891b2;color:#0891b2;">
         <span class="ribbon-btn-icon">&#128203;</span>
         <span class="ribbon-btn-label">Relatório</span>
         <span class="rep-badge"></span>
@@ -504,6 +509,7 @@
         <input type="range" id="em-speed" min="1" max="10" value="5" oninput="document.getElementById('sim-speed').value=this.value" title="Velocidade">
       </div>
       <button class="em-ctrl-btn em-btn-vars" onclick="_emToggleVars()" title="Vari&#225;veis / Arquivos">&#128203;</button>
+      <button class="em-ctrl-btn em-btn-export" onclick="emExportOpen()" title="Exportar log de execu&#231;&#227;o">&#128228;</button>
     </div>
     <button id="em-close-btn" onclick="execMapClose()" title="Fechar Mapa de Execu\u00e7\u00e3o">&#10005;</button>
   </div>
@@ -620,6 +626,110 @@
   <div class="sim-branch-btns">
     <button class="sim-branch-btn no"  onclick="_simRestartDecide('limpar')">&#128465; Limpar tudo</button>
     <button class="sim-branch-btn yes" onclick="_simRestartDecide('continuar')">&#8635; Continuar</button>
+  </div>
+</div>
+
+<!-- ===== MODAL: EXPORTAR LOG EXEC MAP ===== -->
+<div id="em-export-overlay" onclick="if(event.target===this)emExportClose()">
+  <div id="em-export-modal">
+    <div class="em-exp-header">
+      <span class="em-exp-title">&#128228; Exportar Log de Execu&#231;&#227;o</span>
+      <button class="em-exp-close" onclick="emExportClose()" title="Fechar">&#10005;</button>
+    </div>
+    <div class="em-exp-body">
+      <div class="em-exp-label">&#128172; Coment&#225;rio / Observa&#231;&#227;o <span class="em-exp-hint">(opcional — incluído no in&#237;cio do export)</span></div>
+      <textarea id="em-exp-comment" class="em-exp-textarea" placeholder="Digite um comentário ou observação sobre esta execução..."></textarea>
+      <div class="em-exp-label em-exp-label-log">
+        &#128203; Entradas do log
+        <button class="em-exp-sel-btn" onclick="emExportSelectAll(true)">Todas</button>
+        <button class="em-exp-sel-btn" onclick="emExportSelectAll(false)">Nenhuma</button>
+        <span id="em-exp-sel-count" class="em-exp-count"></span>
+      </div>
+      <div id="em-exp-log-list" class="em-exp-log-list"></div>
+    </div>
+    <div class="em-exp-footer">
+      <button class="em-exp-fmt-btn em-exp-txt"  onclick="emExportDo('txt')">&#128196; TXT</button>
+      <button class="em-exp-fmt-btn em-exp-html" onclick="emExportDo('html')">&#127760; HTML</button>
+      <button class="em-exp-fmt-btn em-exp-word" onclick="emExportDo('word')">&#128196; Word</button>
+      <button class="em-exp-fmt-btn em-exp-cancel" onclick="emExportClose()">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== MODAL: EXPORTAR LOG EXEC MAP ===== -->
+<div id="em-export-overlay" onclick="if(event.target===this)emExportClose()">
+  <div id="em-export-modal">
+    <div class="em-exp-header">
+      <span class="em-exp-title">&#128228; Exportar Log de Execu&#231;&#227;o</span>
+      <button class="em-exp-close" onclick="emExportClose()" title="Fechar">&#10005;</button>
+    </div>
+    <div class="em-exp-body">
+      <div class="em-exp-label">&#128172; Coment&#225;rio / Observa&#231;&#227;o <span class="em-exp-hint">(opcional &mdash; inclu&#237;do no in&#237;cio do export)</span></div>
+      <textarea id="em-exp-comment" class="em-exp-textarea" placeholder="Digite um coment&#225;rio ou observa&#231;&#227;o sobre esta execu&#231;&#227;o..."></textarea>
+      <div class="em-exp-label em-exp-label-log">
+        &#128203; Entradas do log
+        <button class="em-exp-sel-btn" onclick="emExportSelectAll(true)">Todas</button>
+        <button class="em-exp-sel-btn" onclick="emExportSelectAll(false)">Nenhuma</button>
+        <span id="em-exp-sel-count" class="em-exp-count"></span>
+      </div>
+      <div id="em-exp-log-list" class="em-exp-log-list"></div>
+    </div>
+    <div class="em-exp-footer">
+      <button class="em-exp-fmt-btn em-exp-txt"    onclick="emExportDo('txt')">&#128196; TXT</button>
+      <button class="em-exp-fmt-btn em-exp-html"   onclick="emExportDo('html')">&#127760; HTML</button>
+      <button class="em-exp-fmt-btn em-exp-word"   onclick="emExportDo('word')">&#128196; Word</button>
+      <button class="em-exp-fmt-btn em-exp-cancel" onclick="emExportClose()">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== MODAL: ONDE EXECUTAR (FAKE SIM) ===== -->
+<div id="fake-sim-run-modal">
+  <div class="sim-branch-title">&#9654; Executar em qual modo?</div>
+  <div class="sim-branch-cond" id="fake-sim-run-modal-path"></div>
+  <div class="sim-branch-btns">
+    <button class="sim-branch-btn fake-sim-run-execmap" onclick="fakeSimRunMode('execmap')">&#9889; Mapa de Execu&#231;&#227;o</button>
+    <button class="sim-branch-btn fake-sim-run-fluxo"   onclick="fakeSimRunMode('fluxo')">&#128393; Fluxo</button>
+    <button class="sim-branch-btn no"                   onclick="fakeSimRunModalClose()">Cancelar</button>
+  </div>
+</div>
+
+<!-- ===== MODAL: SIMULAÇÃO FAKE ===== -->
+<div id="fake-sim-overlay" onclick="fakeSimOverlayClick(event)">
+  <div id="fake-sim-modal">
+    <div class="fake-sim-header">
+      <div class="fake-sim-title">&#127921; Simula&#231;&#227;o Fake &mdash; Escolha um Caminho</div>
+      <div class="fake-sim-subtitle" id="fake-sim-path-count"></div>
+      <button class="fake-sim-close" onclick="fakeSimClose()" title="Fechar">&#10005;</button>
+    </div>
+    <div class="fake-sim-body">
+      <!-- Coluna esquerda: lista de caminhos -->
+      <div class="fake-sim-left">
+        <div class="fake-sim-left-hdr">&#128329; Caminhos Descobertos</div>
+        <div id="fake-sim-filter-bar"></div>
+        <div class="fake-sim-paths-wrap" id="fake-sim-paths-list">
+          <div class="fake-sim-loading">Clique em Abrir para analisar...</div>
+        </div>
+      </div>
+      <!-- Coluna direita: variáveis geradas -->
+      <div class="fake-sim-right">
+        <div class="fake-sim-right-hdr">&#128203; Vari&#225;veis Geradas</div>
+        <div id="fake-sim-vars-preview" class="fake-sim-vars-wrap">
+          <div class="fake-sim-vars-note">Selecione um caminho &#8592;</div>
+        </div>
+      </div>
+    </div>
+    <div class="fake-sim-footer">
+      <div class="fake-sim-footer-left">
+        <button class="fake-sim-btn fake-sim-btn-export-all" onclick="fakeSimExportAllPaths()" title="Exportar documentação de todos os caminhos em .txt">&#128228; Exportar Todos</button>
+        <button class="fake-sim-btn fake-sim-btn-run-all" onclick="fakeSimRunAll()" title="Executar TODOS os caminhos automaticamente e gerar relatório por caminho">&#9654;&#9654; Executar Todos</button>
+      </div>
+      <div class="fake-sim-footer-right">
+        <button class="fake-sim-btn fake-sim-btn-doc" onclick="fakeSimExportDoc()" title="Exportar documentação do caminho selecionado">&#128196; Exportar Doc</button>
+        <button class="fake-sim-btn fake-sim-btn-run" onclick="fakeSimAskMode()" title="Executar o caminho selecionado na simulação">&#9654; Executar Caminho</button>
+        <button class="fake-sim-btn fake-sim-btn-cancel" onclick="fakeSimClose()">Cancelar</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -882,6 +992,7 @@
   </div>
 </div>
 
+<script src="js/fake-sim.js?v=20260412"></script>
 <script src="js/copybook.js?v=20260410f"></script>
 <script src="js/db.js?v=20260411"></script>
 

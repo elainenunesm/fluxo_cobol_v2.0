@@ -450,10 +450,15 @@ var _EXEC_BADGE_MAP = {
   'perform-fall':    { cls: 'fall', lbl: 'FALL' },
   'section-para':    { cls: 'sec',  lbl: 'SEC', hdr: true  },
   'sql':             { cls: 'sql',  lbl: 'SQL'  },
+  'sort':            { cls: 'srt',  lbl: 'SORT' },
+  'sort-input':      { cls: 'srt',  lbl: 'INP'  },
+  'sort-engine':     { cls: 'srt',  lbl: 'ENG'  },
+  'sort-output':     { cls: 'srt',  lbl: 'OUT'  },
   'macro-start':     { cls: 'opn',  lbl: '▶',   hdr: true  },
   'macro-end':       { cls: 'stp',  lbl: '■',   hdr: true  },
   'macro-process':   { cls: 'per',  lbl: 'PRC', hdr: true  },
-  'copy':            { cls: 'cpy',  lbl: 'CPY'  }
+  'copy':            { cls: 'cpy',  lbl: 'CPY'  },
+  'search':          { cls: 'srch', lbl: 'SRCH' }
 };
 
 function toggleDiagExec(e) {
@@ -1268,8 +1273,9 @@ function parseCobol(code) {
 
     // Antes do PROCEDURE DIVISION ignora tudo (exceto FD e 01 do FILE SECTION)
     if (!inProcedure) {
-      // Detecta FD para construir fdMap (registro-01 → nome-arquivo)
-      const fdM = l.match(/^FD\s+([A-Z][A-Z0-9-]*)/i);
+      // Detecta FD/SD para construir fdMap (registro-01 → nome-arquivo)
+      // SD = Sort Description; também mapeado para que RELEASE/RETURN resolvam corretamente
+      const fdM = l.match(/^[SF]D\s+([A-Z][A-Z0-9-]*)/i);
       if (fdM) { _lastFD = fdM[1].toUpperCase(); }
       else if (_lastFD) {
         const recM = l.match(/^01\s+([A-Z][A-Z0-9-]*)/i);
@@ -1451,7 +1457,7 @@ function buildAST(linhas, lineNums, fdMap) {
     }
     // --- PERFORM ----------------------------------------------------------------
     // Verbos que nunca s�o continua��o de condi��o UNTIL
-    const _cobolVerbs = /^(END-PERFORM|END-STRING|END-UNSTRING|END-EXEC|PERFORM|IF|ELSE|EVALUATE|WHEN|MOVE|COMPUTE|ADD|SUBTRACT|MULTIPLY|DIVIDE|CALL|DISPLAY|ACCEPT|OPEN|CLOSE|READ|WRITE|REWRITE|DELETE|STRING|UNSTRING|INSPECT|SEARCH|SORT|STOP|GOBACK|GO[\s\b]|GOTO\b|EXEC\b|EXIT)\b/;
+    const _cobolVerbs = /^(END-PERFORM|END-STRING|END-UNSTRING|END-EXEC|PERFORM|IF|ELSE|EVALUATE|WHEN|MOVE|COMPUTE|ADD|SUBTRACT|MULTIPLY|DIVIDE|CALL|DISPLAY|ACCEPT|OPEN|CLOSE|READ|WRITE|REWRITE|DELETE|STRING|UNSTRING|INSPECT|SEARCH|SORT|RETURN|RELEASE|MERGE|STOP|GOBACK|GO[\s\b]|GOTO\b|EXEC\b|EXIT)\b/;
     // 1. Inline loop (sem nome de par�grafo antes da cl�usula):
     //    PERFORM [WITH TEST BEFORE|AFTER] UNTIL cond ... END-PERFORM
     //    PERFORM [WITH TEST BEFORE|AFTER] VARYING v FROM x BY y UNTIL ... END-PERFORM
@@ -1717,6 +1723,49 @@ function buildAST(linhas, lineNums, fdMap) {
       nodes.push({ type: 'goto', target: gotoM[1] });
       break;
     }
+    // RETURN — leitura do arquivo sort (AT END / NOT AT END / END-RETURN)
+    // Tratado como READ para fins de simulação e renderização do fluxo.
+    if (/^RETURN\b/.test(lUp)) {
+      let _retLbl  = l;
+      let _ratEL = [], _rnotEL = [];
+      let _ratEN = [], _rnotEN = [];
+      let _retBlk = null, _retDone = false;
+      while (i < linhas.length && !_retDone) {
+        let _rrtTr  = linhas[i].trim();
+        let _rrtPer = _rrtTr.endsWith('.');
+        let _rrtUp  = _rrtTr.replace(/\.$/, '').toUpperCase();
+        let _rrtLN  = lineNums ? lineNums[i] : null;
+        i++;
+        if (!_rrtUp) { if (_rrtPer) _retDone = true; continue; }
+        if (/^END-RETURN\b/.test(_rrtUp)) { _retDone = true; break; }
+        let _raM  = _rrtUp.match(/^AT\s+END\b(.*)/);
+        let _rnaM = _rrtUp.match(/^NOT\s+AT\s+END\b(.*)/);
+        if (_raM) {
+          _retBlk = 'atend';
+          let _il = _raM[1].trim(); if (_il) { _ratEL.push(_il); _ratEN.push(_rrtLN); }
+        } else if (_rnaM) {
+          _retBlk = 'notatend';
+          let _il = _rnaM[1].trim(); if (_il) { _rnotEL.push(_il); _rnotEN.push(_rrtLN); }
+        } else {
+          if      (_retBlk === 'atend')    { _ratEL.push(_rrtUp);  _ratEN.push(_rrtLN); }
+          else if (_retBlk === 'notatend') { _rnotEL.push(_rrtUp); _rnotEN.push(_rrtLN); }
+        }
+        if (_rrtPer) { _retDone = true; break; }
+      }
+      nodes.push({
+        type: 'read',
+        label: _retLbl,
+        detail: [_retLbl,
+          _ratEL.length  ? 'AT END\n    '     + _ratEL.join('\n    ')  : null,
+          _rnotEL.length ? 'NOT AT END\n    ' + _rnotEL.join('\n    ') : null,
+          'END-RETURN'].filter(Boolean).join('\n'),
+        srcLine: _srcLine,
+        atEnd:    _ratEL.length  ? buildAST(_ratEL,  _ratEN,  fdMap) : null,
+        notAtEnd: _rnotEL.length ? buildAST(_rnotEL, _rnotEN, fdMap) : null,
+        invalidKey: null,
+      });
+      continue;
+    }
     // READ — multi-linha: AT END / NOT AT END / INVALID KEY / END-READ ou ponto
     if (/^READ\b/.test(lUp)) {
       let _readLbl   = l;
@@ -1771,6 +1820,59 @@ function buildAST(linhas, lineNums, fdMap) {
         notAtEnd:   _notEL.length ? buildAST(_notEL, _notEN, fdMap) : null,
         invalidKey: _invKL.length ? buildAST(_invKL, _invKN, fdMap) : null,
       });
+      continue;
+    }
+    // RETURN (SORT) — lê registro ordenado do arquivo SD; estrutura idêntica ao READ
+    if (/^RETURN\b/.test(lUp)) {
+      let _retLbl = l;
+      let _atEL = [], _notEL = [];
+      let _atEN = [], _notEN = [];
+      let _rBlk2 = null, _rDone2 = false;
+      while (i < linhas.length && !_rDone2) {
+        let _rtTr2  = linhas[i].trim();
+        let _rtPer2 = _rtTr2.endsWith('.');
+        let _rtUp2  = _rtTr2.replace(/\.$/, '').toUpperCase();
+        let _rtLN2  = lineNums ? lineNums[i] : null;
+        i++;
+        if (!_rtUp2) { if (_rtPer2) _rDone2 = true; continue; }
+        if (/^END-RETURN\b/.test(_rtUp2)) { _rDone2 = true; break; }
+        let _aM2  = _rtUp2.match(/^AT\s+END\b(.*)/);
+        let _naM2 = _rtUp2.match(/^NOT\s+AT\s+END\b(.*)/);
+        if (_aM2)       { _rBlk2 = 'atend';    let il = _aM2[1].trim();  if (il) { _atEL.push(il); _atEN.push(_rtLN2); } }
+        else if (_naM2) { _rBlk2 = 'notatend'; let il = _naM2[1].trim(); if (il) { _notEL.push(il); _notEN.push(_rtLN2); } }
+        else {
+          if      (_rBlk2 === 'atend')    { _atEL.push(_rtUp2);  _atEN.push(_rtLN2); }
+          else if (_rBlk2 === 'notatend') { _notEL.push(_rtUp2); _notEN.push(_rtLN2); }
+        }
+        if (_rtPer2) { _rDone2 = true; break; }
+      }
+      let _retParts = [_retLbl];
+      if (_atEL.length)  { _retParts.push('AT END');     _atEL.forEach(function(x){ _retParts.push('    '+x); }); }
+      if (_notEL.length) { _retParts.push('NOT AT END'); _notEL.forEach(function(x){ _retParts.push('    '+x); }); }
+      _retParts.push('END-RETURN');
+      nodes.push({
+        type: 'read',
+        label: _retLbl,
+        detail: _retParts.join('\n'),
+        srcLine: _srcLine,
+        atEnd:    _atEL.length  ? buildAST(_atEL,  _atEN,  fdMap) : null,
+        notAtEnd: _notEL.length ? buildAST(_notEL, _notEN, fdMap) : null,
+      });
+      continue;
+    }
+    // RELEASE — grava registro no arquivo SD (sort work file); tratado como WRITE
+    if (/^RELEASE\b/.test(lUp)) {
+      let _relRegM = lUp.match(/^RELEASE\s+([A-Z][A-Z0-9-]*)/);
+      let _relReg  = _relRegM ? _relRegM[1] : '';
+      let _relFile = fdMap[_relReg] || _relReg;  // fdMap inclui SD (pois expandimos acima)
+      let _relLines = [l];
+      // Consome cláusula FROM opcional na linha seguinte
+      if (i < linhas.length && /^FROM\b/i.test(linhas[i].trim().toUpperCase())) {
+        _relLines.push(linhas[i].trim()); i++;
+      }
+      nodes.push({ type: 'write', label: 'RELEASE\n' + _relFile,
+                   writeVerb: 'RELEASE', fileName: _relFile, regName: _relReg,
+                   detail: _relLines.join('\n'), srcLine: _srcLine });
       continue;
     }
     // OPEN → bloco Preparação (trapézio) — abre arquivo para leitura/gravação
@@ -1886,6 +1988,138 @@ function buildAST(linhas, lineNums, fdMap) {
       var _wLabel  = _verb + '\n' + _file;
       var _wDetail = _wLines.join('\n');
       nodes.push({ type: 'write', label: _wLabel, writeVerb: _verb, fileName: _file, regName: _reg, detail: _wDetail, srcLine: _srcLine });
+      continue;
+    }
+    // SORT — interno (INPUT/OUTPUT PROCEDURE) ou externo (USING/GIVING)
+    if (/^SORT\b/.test(lUp)) {
+      var _sortFileName = (lUp.match(/^SORT\s+([A-Z][A-Z0-9-]*)/) || [])[1] || '';
+      var _sortLines = [l];
+      var _sortKeys = [], _sortInputProc = null, _sortOutputProc = null;
+      var _sortUsing = [], _sortGiving = [];
+      var _sortDone = false;
+      // Verbos que NÃO são continuação do SORT
+      var _sortBreakRe = /^(PERFORM|IF\b|ELSE\b|EVALUATE|MOVE|COMPUTE|ADD|SUBTRACT|MULTIPLY|DIVIDE|CALL|DISPLAY|ACCEPT|OPEN|CLOSE|READ|WRITE|REWRITE|DELETE|STRING|UNSTRING|INSPECT|SEARCH|EXEC\b|GO\s+TO|GOTO\b|STOP\s+RUN|GOBACK|EXIT\b|INITIALIZE)/;
+      // Parse de uma linha de continuação do SORT
+      var _parseSortLine = function(uLine) {
+        var keyM = uLine.match(/^ON\s+(ASCENDING|DESCENDING)(?:\s+KEY)?\s+(.*)/);
+        if (keyM) {
+          var fields2 = keyM[2].trim().split(/\s+/).filter(function(f){ return f && !/^(ON|ASCENDING|DESCENDING|KEY|INPUT|OUTPUT|USING|GIVING|PROCEDURE|IS)$/i.test(f); });
+          fields2.forEach(function(f){ _sortKeys.push(keyM[1].charAt(0) + ':' + f); });
+          return;
+        }
+        var inM = uLine.match(/^INPUT\s+PROCEDURE(?:\s+IS)?\s+([A-Z][A-Z0-9-]*)/);
+        if (inM) { _sortInputProc = inM[1]; return; }
+        var outM = uLine.match(/^OUTPUT\s+PROCEDURE(?:\s+IS)?\s+([A-Z][A-Z0-9-]*)/);
+        if (outM) { _sortOutputProc = outM[1]; return; }
+        var usingM = uLine.match(/^USING\s+(.*)/);
+        if (usingM) { _sortUsing = usingM[1].trim().split(/\s+/).filter(Boolean); return; }
+        var givingM = uLine.match(/^GIVING\s+(.*)/);
+        if (givingM) { _sortGiving = givingM[1].trim().split(/\s+/).filter(Boolean); return; }
+      };
+      // Processa o restante da primeira linha após SORT arq-nome
+      var _afterSort = lUp.replace(/^SORT\s+[A-Z][A-Z0-9-]*\s*/, '');
+      if (_afterSort.trim()) _parseSortLine(_afterSort.trim());
+      // Consome linhas de continuação
+      while (i < linhas.length && !_sortDone) {
+        var _sRaw = linhas[i].trim();
+        var _sPer = _sRaw.endsWith('.');
+        var _sUp  = _sRaw.replace(/\.$/, '').toUpperCase();
+        if (!_sUp) { i++; if (_sPer) { _sortDone = true; } continue; }
+        if (_sortBreakRe.test(_sUp)) { _sortDone = true; break; }
+        i++;
+        _parseSortLine(_sUp);
+        _sortLines.push(_sRaw);
+        if (_sPer) { _sortDone = true; break; }
+      }
+      // Constrói label visual
+      var _isInternalSort = !!(_sortInputProc || _sortOutputProc);
+      var _sortLabel = 'SORT\n' + _sortFileName;
+      if (_sortKeys.length) {
+        _sortLabel += '\n' + _sortKeys.map(function(k){
+          var p = k.split(':');
+          return (p[0] === 'A' ? '↑' : '↓') + ' ' + p[1];
+        }).join('  ');
+      }
+      if (!_isInternalSort) {
+        if (_sortUsing.length)  _sortLabel += '\nUSING '  + _sortUsing.join(' ');
+        if (_sortGiving.length) _sortLabel += '\nGIVING ' + _sortGiving.join(' ');
+      }
+      nodes.push({
+        type: 'sort',
+        label: _sortLabel,
+        sortFile: _sortFileName,
+        sortKeys: _sortKeys,
+        inputProc: _sortInputProc,
+        outputProc: _sortOutputProc,
+        using: _sortUsing,
+        giving: _sortGiving,
+        isInternal: _isInternalSort,
+        detail: _sortLines.join('\n'),
+        srcLine: _srcLine
+      });
+      continue;
+    }
+    // SEARCH [ALL] — busca em tabela interna; coleta AT END e WHENs
+    if (/^SEARCH\b/.test(lUp)) {
+      var _srchAll = /^SEARCH\s+ALL\b/.test(lUp);
+      var _srchM   = lUp.match(/^SEARCH(?:\s+ALL)?\s+([A-Z][A-Z0-9-]*)/);
+      var _srchTbl = _srchM ? _srchM[1] : '?';
+      var _srchAtEndL = [], _srchAtEndN = [];
+      var _srchWhens  = []; // [{condition, bodyL, bodyN}]
+      var _srchCurBlk = null; // null | 'atend' | {type:'when', idx}
+      var _srchDone   = false;
+      while (i < linhas.length && !_srchDone) {
+        var _stTr  = linhas[i].trim();
+        var _stPer = _stTr.endsWith('.');
+        var _stUp  = _stTr.replace(/\.$/, '').toUpperCase().trim();
+        var _stLN  = lineNums ? lineNums[i] : null;
+        i++;
+        if (!_stUp) { if (_stPer) _srchDone = true; continue; }
+        if (/^END-SEARCH\b/.test(_stUp)) { _srchDone = true; break; }
+        var _aM = _stUp.match(/^AT\s+END\b(.*)/);
+        var _wM = _stUp.match(/^WHEN\b(.*)/);
+        if (_aM) {
+          _srchCurBlk = 'atend';
+          var _aIl = _aM[1].trim(); if (_aIl) { _srchAtEndL.push(_aIl); _srchAtEndN.push(_stLN); }
+        } else if (_wM) {
+          _srchWhens.push({ condition: _wM[1].trim() || '?', bodyL: [], bodyN: [] });
+          _srchCurBlk = { type: 'when', idx: _srchWhens.length - 1 };
+        } else {
+          if (_srchCurBlk === 'atend') {
+            _srchAtEndL.push(_stUp); _srchAtEndN.push(_stLN);
+          } else if (_srchCurBlk && _srchCurBlk.type === 'when') {
+            var _cW = _srchWhens[_srchCurBlk.idx];
+            // Linha AND/OR sem corpo ainda → estende a condição
+            if (_cW.bodyL.length === 0 && /^(AND|OR)\b/.test(_stUp)) {
+              _cW.condition += ' ' + _stUp;
+            } else {
+              _cW.bodyL.push(_stTr.replace(/\.$/, '')); _cW.bodyN.push(_stLN);
+            }
+          }
+        }
+        if (_stPer) { _srchDone = true; break; }
+      }
+      var _srchLbl = (_srchAll ? 'SEARCH ALL' : 'SEARCH') + '\n' + _srchTbl;
+      var _srchParts = [l];
+      if (_srchAtEndL.length) { _srchParts.push('AT END'); _srchAtEndL.forEach(function(x){ _srchParts.push('    '+x); }); }
+      _srchWhens.forEach(function(w) {
+        _srchParts.push('WHEN ' + w.condition);
+        w.bodyL.forEach(function(x){ _srchParts.push('    '+x); });
+      });
+      _srchParts.push('END-SEARCH');
+      nodes.push({
+        type: 'search',
+        label: _srchLbl,
+        detail: _srchParts.join('\n'),
+        srcLine: _srcLine,
+        searchAll: _srchAll,
+        searchTable: _srchTbl,
+        atEnd:  _srchAtEndL.length ? buildAST(_srchAtEndL, _srchAtEndN, fdMap) : null,
+        whens:  _srchWhens.map(function(w) {
+          return { condition: w.condition,
+                   body: w.bodyL.length ? buildAST(w.bodyL, w.bodyN, fdMap) : null };
+        })
+      });
       continue;
     }
     // Demais operações de I/O → paralelogramo (DISPLAY, ACCEPT, DELETE…)
@@ -2061,12 +2295,68 @@ function renderNode(n, els, uid, meta, cs, depth) {
     return [readId, mRId];
   }
 
+  if (n.type === 'search') {
+    // Nó principal: representa o SEARCH / SEARCH ALL
+    let searchId = uid('srch');
+    els.push({ data: { id: searchId, label: n.label, tipo: 'search',
+                       searchAll: n.searchAll ? 'true' : 'false',
+                       col: _col(), para: meta.currentPara || '',
+                       detail: n.detail || n.label,
+                       srcLine: n.srcLine != null ? n.srcLine : undefined } });
+    // Sem WHENs → nó simples
+    if (!n.whens || n.whens.length === 0) return [searchId, searchId];
+
+    let mSrchId = uid('mg');
+    els.push({ data: { id: mSrchId, label: '', tipo: 'merge', col: _col() } });
+    meta._ifDepth = (meta._ifDepth || 0) + 1;
+
+    // Encadeia WHENs: WHEN1 → (SIM → body, NÃO → WHEN2 → ... → AT END)
+    let _srchLastEntry = searchId;
+    n.whens.forEach(function(when, idx) {
+      let whenDecId = uid('if');
+      let whenLbl = 'WHEN\n' + when.condition;
+      els.push({ data: { id: whenDecId, label: whenLbl, tipo: 'if',
+                         col: _col(), para: meta.currentPara || '' } });
+      // Ligação do nó anterior a este WHEN
+      els.push({ data: { source: _srchLastEntry, target: whenDecId,
+                         label: idx === 0 ? '' : 'Não' } });
+      // Ramo SIM → corpo do WHEN
+      if (when.body && when.body.length) {
+        let [wf, wl] = renderSeq(when.body, els, uid, meta, cs, depth);
+        if (wf) {
+          els.push({ data: { source: whenDecId, target: wf, label: 'SIM' } });
+          els.push({ data: { source: wl || wf, target: mSrchId } });
+        } else {
+          els.push({ data: { source: whenDecId, target: mSrchId, label: 'SIM' } });
+        }
+      } else {
+        els.push({ data: { source: whenDecId, target: mSrchId, label: 'SIM' } });
+      }
+      _srchLastEntry = whenDecId;
+    });
+
+    // Ramo AT END (Não do último WHEN)
+    if (n.atEnd && n.atEnd.length) {
+      let [af, al] = renderSeq(n.atEnd, els, uid, meta, cs, depth);
+      if (af) {
+        els.push({ data: { source: _srchLastEntry, target: af, label: 'AT END' } });
+        els.push({ data: { source: al || af, target: mSrchId } });
+      } else {
+        els.push({ data: { source: _srchLastEntry, target: mSrchId, label: 'AT END' } });
+      }
+    } else {
+      els.push({ data: { source: _srchLastEntry, target: mSrchId, label: 'AT END' } });
+    }
+
+    meta._ifDepth--;
+    return [searchId, mSrchId];
+  }
+
   if (n.type === 'io') {
     let id = uid('io');
     els.push({ data: { id, label: n.label, tipo: 'io', col: _col(), para: meta.currentPara || '', srcLine: n.srcLine != null ? n.srcLine : undefined } });
     return [id, id];
   }
-
   if (n.type === 'open') {
     let id = uid('open');
     els.push({ data: { id, label: n.label, tipo: 'open', col: _col(), para: meta.currentPara || '', srcLine: n.srcLine != null ? n.srcLine : undefined } });
@@ -2342,6 +2632,82 @@ function renderNode(n, els, uid, meta, cs, depth) {
                        col: _col(), para: meta.currentPara || '',
                        srcLine: n.srcLine != null ? n.srcLine : undefined } });
     return [id, id];
+  }
+
+  // ── SORT interno / externo ──────────────────────────────────────
+  if (n.type === 'sort') {
+    const _sortColAnchor = _col();
+    let sortId = uid('sort');
+    els.push({ data: { id: sortId, label: n.label, tipo: 'sort',
+                       sortFile: n.sortFile || '',
+                       col: _sortColAnchor, detail: n.detail || n.label,
+                       para: meta.currentPara || '',
+                       srcLine: n.srcLine != null ? n.srcLine : undefined } });
+    // SORT externo (USING/GIVING): nó único
+    if (!n.isInternal) return [sortId, sortId];
+
+    // SORT interno: SORT → INPUT PROCEDURE → ⚙ ENGINE → OUTPUT PROCEDURE
+    let _sortLast = sortId;
+    const _sortSavedPara = meta.currentPara;
+
+    // ── INPUT PROCEDURE ─────────────────────────────────────────
+    if (n.inputProc) {
+      const _inSec = meta.tipos && meta.tipos[n.inputProc] === 'section';
+      let inpId = uid('sort-inp');
+      els.push({ data: { id: inpId, label: 'INPUT PROCEDURE\n' + n.inputProc,
+                         tipo: 'sort-input', target: n.inputProc,
+                         col: _sortColAnchor, para: meta.currentPara || '' } });
+      els.push({ data: { source: _sortLast, target: inpId, label: 'INPUT→RELEASE' } });
+      if (depth < meta.maxDepth && !cs.has(n.inputProc)) {
+        const _inNs = new Set(cs);
+        _inNs.add(n.inputProc);
+        meta.currentPara = n.inputProc;
+        const _inAst = buildAST(meta.estrutura[n.inputProc] || [],
+                                 meta.lineNumMap ? meta.lineNumMap[n.inputProc] : null,
+                                 meta.fdMap);
+        const [_inF, _inL] = renderSeq(_inAst, els, uid, meta, _inNs, depth + 1);
+        if (_inF) { els.push({ data: { source: inpId, target: _inF } }); }
+        _sortLast = _inL || inpId;
+      } else {
+        _sortLast = inpId;
+      }
+      meta.currentPara = _sortSavedPara;
+    }
+
+    // ── ENGINE SORT ─────────────────────────────────────────────
+    let engId = uid('sort-eng');
+    els.push({ data: { id: engId, label: '⚙ SORT ENGINE\nDFSORT / SYNCSORT',
+                       tipo: 'sort-engine', col: _sortColAnchor,
+                       para: meta.currentPara || '',
+                       sortFile: n.sortFile || '',
+                       sortKeys: JSON.stringify(n.sortKeys || []) } });
+    els.push({ data: { source: _sortLast, target: engId, label: 'RELEASE' } });
+    _sortLast = engId;
+
+    // ── OUTPUT PROCEDURE ────────────────────────────────────────
+    if (n.outputProc) {
+      let outId = uid('sort-out');
+      els.push({ data: { id: outId, label: 'OUTPUT PROCEDURE\n' + n.outputProc,
+                         tipo: 'sort-output', target: n.outputProc,
+                         col: _sortColAnchor, para: meta.currentPara || '' } });
+      els.push({ data: { source: _sortLast, target: outId, label: 'RETURN' } });
+      if (depth < meta.maxDepth && !cs.has(n.outputProc)) {
+        const _outNs = new Set(cs);
+        _outNs.add(n.outputProc);
+        meta.currentPara = n.outputProc;
+        const _outAst = buildAST(meta.estrutura[n.outputProc] || [],
+                                  meta.lineNumMap ? meta.lineNumMap[n.outputProc] : null,
+                                  meta.fdMap);
+        const [_outF, _outL] = renderSeq(_outAst, els, uid, meta, _outNs, depth + 1);
+        if (_outF) { els.push({ data: { source: outId, target: _outF } }); }
+        _sortLast = _outL || outId;
+      } else {
+        _sortLast = outId;
+      }
+      meta.currentPara = _sortSavedPara;
+    }
+
+    return [sortId, _sortLast];
   }
 
   return [null, null];
@@ -3133,6 +3499,102 @@ function desenhar(elements, meta) {
           'height': 48,
           'text-wrap': 'wrap',
           'text-max-width': '172px'
+        }
+      },
+      /* -- SEARCH / SEARCH ALL — busca em tabela interna -------- */
+      {
+        selector: 'node[tipo="search"]',
+        style: {
+          'shape': 'round-rectangle',
+          'background-color': '#431407',
+          'border-color': '#f97316',
+          'border-width': 2.5,
+          'color': '#fed7aa',
+          'font-size': '11px',
+          'font-weight': 700,
+          'font-family': 'Cascadia Code, Fira Code, Consolas, monospace',
+          'width': 195,
+          'min-height': 48,
+          'padding': '10px',
+          'text-wrap': 'wrap',
+          'text-max-width': '176px'
+        }
+      },
+      { selector: 'node[tipo="search"][searchAll="true"]',
+        style: { 'background-color': '#3b0764', 'border-color': '#c084fc', 'color': '#e9d5ff' } },
+      /* -- SORT principal (losango oblongo) -------------------- */
+      {
+        selector: 'node[tipo="sort"]',
+        style: {
+          'shape': 'round-rectangle',
+          'background-color': '#042f2e',
+          'border-color': '#0d9488',
+          'border-width': 3,
+          'color': '#99f6e4',
+          'font-size': '11px',
+          'font-weight': 700,
+          'font-family': 'Cascadia Code, Fira Code, Consolas, monospace',
+          'width': 200,
+          'min-height': 52,
+          'padding': '12px',
+          'text-wrap': 'wrap',
+          'text-max-width': '180px'
+        }
+      },
+      /* -- INPUT PROCEDURE do SORT (trapézio esquerdo) --------- */
+      {
+        selector: 'node[tipo="sort-input"]',
+        style: {
+          'shape': 'rhomboid',
+          'background-color': '#083344',
+          'border-color': '#38bdf8',
+          'border-width': 2,
+          'color': '#bae6fd',
+          'font-size': '11px',
+          'font-weight': 700,
+          'font-family': 'Cascadia Code, Fira Code, Consolas, monospace',
+          'width': 200,
+          'min-height': 48,
+          'padding': '10px',
+          'text-wrap': 'wrap',
+          'text-max-width': '180px'
+        }
+      },
+      /* -- ENGINE SORT (cilindro): representa DFSORT/SYNCSORT -- */
+      {
+        selector: 'node[tipo="sort-engine"]',
+        style: {
+          'shape': 'barrel',
+          'background-color': '#14532d',
+          'border-color': '#22c55e',
+          'border-width': 2,
+          'color': '#bbf7d0',
+          'font-size': '11px',
+          'font-weight': 700,
+          'font-family': 'Segoe UI, Arial, sans-serif',
+          'width': 200,
+          'height': 60,
+          'text-wrap': 'wrap',
+          'text-max-width': '180px'
+        }
+      },
+      /* -- OUTPUT PROCEDURE do SORT (trapézio direito) --------- */
+      {
+        selector: 'node[tipo="sort-output"]',
+        style: {
+          'shape': 'rhomboid',
+          'background-color': '#2d1657',
+          'border-color': '#a78bfa',
+          'border-width': 2,
+          'color': '#ede9fe',
+          'font-size': '11px',
+          'font-weight': 700,
+          'font-family': 'Cascadia Code, Fira Code, Consolas, monospace',
+          'width': 200,
+          'min-height': 48,
+          'padding': '10px',
+          'text-wrap': 'wrap',
+          'text-max-width': '180px'
         }
       },
       /* -- ARESTAS -- */
@@ -6614,6 +7076,222 @@ function execMapClose() {
   if (vp) vp.classList.remove('sim-vars-visible');
   simStop(true);
 }
+
+// ── Exportar Log do Mapa de Execução ─────────────────────────────
+
+var _emExportItems = [];
+
+function emExportOpen() {
+  if (!_emLogHistory || !_emLogHistory.length) {
+    alert('Nenhuma entrada no log para exportar. Execute uma simulação primeiro.');
+    return;
+  }
+  _emExportItems = _emLogHistory.map(function (e, i) {
+    return { idx: i, msg: e.msg, cls: e.cls || '', checked: true };
+  });
+
+  var listEl = document.getElementById('em-exp-log-list');
+  listEl.innerHTML = '';
+  _emExportItems.forEach(function (item) {
+    var row = document.createElement('label');
+    row.className = 'em-exp-log-row';
+    var cb = document.createElement('input');
+    cb.type    = 'checkbox';
+    cb.checked = true;
+    cb.dataset.idx = item.idx;
+    cb.addEventListener('change', function () {
+      _emExportItems[item.idx].checked = this.checked;
+      _emExpUpdateCount();
+    });
+    var txt = document.createElement('span');
+    txt.className   = 'em-exp-log-text' + (item.cls ? ' ' + item.cls : '');
+    txt.textContent = item.msg;
+    row.appendChild(cb);
+    row.appendChild(txt);
+    listEl.appendChild(row);
+  });
+
+  document.getElementById('em-exp-comment').value = '';
+  _emExpUpdateCount();
+  document.getElementById('em-export-overlay').classList.add('open');
+}
+
+function emExportClose() {
+  document.getElementById('em-export-overlay').classList.remove('open');
+}
+
+function emExportSelectAll(checked) {
+  _emExportItems.forEach(function (item) { item.checked = checked; });
+  document.querySelectorAll('#em-exp-log-list input[type=checkbox]').forEach(function (cb) { cb.checked = checked; });
+  _emExpUpdateCount();
+}
+
+function _emExpUpdateCount() {
+  var sel = _emExportItems.filter(function (i) { return i.checked; }).length;
+  var el = document.getElementById('em-exp-sel-count');
+  if (el) el.textContent = sel + ' / ' + _emExportItems.length + ' entradas';
+}
+
+function emExportDo(format) {
+  var comment  = (document.getElementById('em-exp-comment').value || '').trim();
+  var selected = _emExportItems.filter(function (i) { return i.checked; });
+  if (!selected.length) { alert('Selecione ao menos uma entrada para exportar.'); return; }
+
+  var code  = (document.getElementById('input') || {}).value || '';
+  var progM = code.match(/PROGRAM-ID\.?\s+([A-Z0-9][A-Z0-9-]*)/i);
+  var prog  = progM ? progM[1].toUpperCase() : 'PROGRAMA';
+  var date  = new Date().toLocaleString('pt-BR');
+
+  if (format === 'txt')  _emExportTxt (selected, comment, prog, date);
+  if (format === 'html') _emExportHtml(selected, comment, prog, date);
+  if (format === 'word') _emExportWord(selected, comment, prog, date);
+  emExportClose();
+}
+
+function _emExportTxt(entries, comment, prog, date) {
+  var SEP  = '================================================================';
+  var SEP2 = '────────────────────────────────────────────────────────';
+  var lines = [
+    SEP,
+    '  LOG DE EXECUÇÃO — MAPA DE EXECUÇÃO — COBOL Flow',
+    SEP,
+    'Programa  : ' + prog,
+    'Gerado em : ' + date,
+    ''
+  ];
+  if (comment) {
+    lines.push('COMENTÁRIO / OBSERVAÇÃO:');
+    comment.split('\n').forEach(function (l) { lines.push('  ' + l); });
+    lines.push('');
+    lines.push(SEP2);
+    lines.push('');
+  }
+  entries.forEach(function (e) { lines.push(e.msg); });
+  lines.push('');
+  lines.push(SEP);
+  lines.push('  Gerado por COBOL Flow — Mapa de Execução');
+  lines.push(SEP);
+
+  _emDownload(lines.join('\n'), prog + '_execlog.txt', 'text/plain;charset=utf-8');
+}
+
+function _emExportHtml(entries, comment, prog, date) {
+  var clrMap = {
+    'sim-log-info'    : '#4338ca',
+    'sim-log-branch'  : '#92400e',
+    'sim-log-end'     : '#15803d',
+    'sim-log-move'    : '#374151',
+    'sim-log-display' : '#065f46',
+    'sim-log-bp'      : '#dc2626',
+    'sim-log-file-var': '#047857',
+    'sim-log-sep'     : '#9ca3af',
+    'sim-log-section' : '#3730a3',
+    'sim-log-var'     : '#0e7490',
+    'sim-log-detail'  : '#6b7280',
+    'sim-log-warn'    : '#b45309',
+    'sim-log-sort'    : '#0d9488',
+    'sim-log-search'  : '#ea580c'
+  };
+
+  var rows = entries.map(function (e) {
+    var c  = clrMap[e.cls] || '#1f2937';
+    var fw = e.cls === 'sim-log-section' ? 'font-weight:700;' : '';
+    var fs = (e.cls === 'sim-log-detail' || e.cls === 'sim-log-move') ? 'font-size:11px;' : '';
+    return '<div style="padding:1px 0;white-space:pre-wrap;font-family:monospace;color:' + c + ';' + fw + fs + '">' + _emEscHtml(e.msg) + '</div>';
+  }).join('\n');
+
+  var commentBlock = '';
+  if (comment) {
+    commentBlock = '<div style="background:#fffbeb;border-left:3px solid #d97706;padding:10px 14px;margin-bottom:16px;color:#78350f;white-space:pre-wrap;font-family:monospace;font-size:13px;border-radius:4px;">'
+      + '<strong style="display:block;margin-bottom:6px;font-size:11px;color:#92400e;text-transform:uppercase;letter-spacing:.5px;">Comentário</strong>'
+      + _emEscHtml(comment) + '</div>';
+  }
+
+  var html = '<!DOCTYPE html>\n<html lang="pt-BR">\n<head>\n<meta charset="UTF-8">\n'
+    + '<title>Log Exec Map \u2014 ' + prog + '</title>\n'
+    + '<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#ffffff;color:#1f2937;font-family:\'Segoe UI\',Arial,sans-serif;padding:24px}'
+    + 'h1{color:#3730a3;font-size:16px;font-weight:700;margin-bottom:4px}.meta{color:#6b7280;font-size:11px;margin-bottom:18px}'
+    + '.log{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px 16px;font-size:12px;line-height:1.8}</style>\n</head>\n<body>\n'
+    + '<h1>\u26a1 Log de Execu\u00e7\u00e3o \u2014 ' + _emEscHtml(prog) + '</h1>\n'
+    + '<div class="meta">Gerado em ' + date + ' &nbsp;&middot;&nbsp; COBOL Flow \u2014 Mapa de Execu\u00e7\u00e3o</div>\n'
+    + commentBlock
+    + '<div class="log">\n' + rows + '\n</div>\n</body>\n</html>';
+
+  _emDownload(html, prog + '_execlog.html', 'text/html;charset=utf-8');
+}
+
+function _emExportWord(entries, comment, prog, date) {
+  // RTF — abre direto no Word (fundo branco, cores escuras de alto contraste)
+  var clrIdx = {
+    'sim-log-info'    : 2,
+    'sim-log-branch'  : 3,
+    'sim-log-end'     : 4,
+    'sim-log-move'    : 5,
+    'sim-log-display' : 6,
+    'sim-log-bp'      : 7,
+    'sim-log-file-var': 8,
+    'sim-log-sep'     : 9,
+    'sim-log-section' : 10,
+    'sim-log-var'     : 11,
+    'sim-log-detail'  : 12,
+    'sim-log-warn'    : 3,
+    'sim-log-sort'    : 14,
+    'sim-log-search'  : 15
+  };
+  // Tabela de cores dark-on-white (cf1..cf14)
+  // cf1  = #1f2937 default text       cf2  = #4338ca info (indigo escuro)
+  // cf3  = #92400e branch/warn        cf4  = #15803d end (verde escuro)
+  // cf5  = #374151 move               cf6  = #065f46 display (teal escuro)
+  // cf7  = #dc2626 bp (vermelho)      cf8  = #047857 file-var (verde menta)
+  // cf9  = #6b7280 sep (cinza)        cf10 = #3730a3 section (indigo bold)
+  // cf11 = #0e7490 var (ciano escuro) cf12 = #6b7280 detail (cinza)
+  // cf13 = #78350f comentário (marrom) cf14 = #0d9488 sort (teal) cf15 = #ea580c search (laranja)
+  var rtf = [
+    '{\\rtf1\\ansi\\ansicpg1252\\deff0',
+    '{\\fonttbl{\\f0\\fmodern\\fcharset0 Courier New;}{\\f1\\fswiss\\fcharset0 Segoe UI;}}',
+    '{\\colortbl;\\red31\\green41\\blue55;\\red67\\green56\\blue202;\\red146\\green64\\blue14;\\red21\\green128\\blue61;\\red55\\green65\\blue81;\\red6\\green95\\blue70;\\red220\\green38\\blue38;\\red4\\green120\\blue87;\\red107\\green114\\blue128;\\red55\\green48\\blue163;\\red14\\green116\\blue144;\\red107\\green114\\blue128;\\red120\\green53\\blue15;\\red13\\green148\\blue136;\\red234\\green88\\blue12;}',
+    '\\widowctrl\\wpaper12240\\wpapr15840\\margl1440\\margr1440\\margt1440\\margb1440',
+    '\\f1\\fs26\\b\\cf2 ' + _emRtfEsc('LOG DE EXECUÇÃO — ' + prog) + '\\b0\\par',
+    '\\cf9\\fs18 ' + _emRtfEsc('Gerado em ' + date + ' · COBOL Flow — Mapa de Execução') + '\\cf1\\par\\par'
+  ];
+
+  if (comment) {
+    rtf.push('\\cf13\\b ' + _emRtfEsc('COMENTÁRIO:') + '\\b0\\par');
+    comment.split('\n').forEach(function (l) {
+      rtf.push('\\cf13 ' + _emRtfEsc('  ' + l) + '\\par');
+    });
+    rtf.push('\\cf1\\par');
+  }
+
+  rtf.push('\\f0\\fs18');
+  entries.forEach(function (e) {
+    var ci   = clrIdx[e.cls] || 1;
+    var bold = e.cls === 'sim-log-section' ? '\\b ' : '';
+    rtf.push('\\cf' + ci + ' ' + bold + _emRtfEsc(e.msg) + (bold ? '\\b0' : '') + '\\par');
+  });
+  rtf.push('}');
+
+  _emDownload(rtf.join('\n'), prog + '_execlog.rtf', 'application/rtf');
+}
+
+function _emRtfEsc(s) {
+  return String(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/\{/g,  '\\{')
+    .replace(/\}/g,  '\\}')
+    .replace(/[^\x00-\x7F]/g, function (c) { return '\\u' + c.charCodeAt(0) + '?'; });
+}
+
+function _emDownload(content, filename, mime) {
+  var blob = new Blob([content], { type: mime });
+  var url  = URL.createObjectURL(blob);
+  var a    = document.createElement('a');
+  a.href     = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 
 function _emRenderCode(code) {
   var el = document.getElementById('em-code-body');

@@ -13,8 +13,11 @@ var _sim88Defs  = {};   // { 'FLAG-ATIVO': { parent: 'WS-FLAG', values: ['S','Y'
 var _simFiles         = {};   // { 'ARQ-ENTRADA': { fields:[], records:[], pointer:0, isOpen:false } }
 var _simFileStatusMap = {};   // { 'ARQ-ENTRADA': 'WS-ST-ENTRADA' } — FILE STATUS IS <var>
 var _simFileStatusMapDebug = {}; // cópia para log de diagnóstico
+var _simHeadless       = false; // true durante execução em lote (sem UI)
+var _simOnRunComplete  = null;  // callback chamado ao terminar quando _simHeadless
 var _simLastReadAtEnd = false;  // resultado do último READ (true = AT END)
 var _simDb2Tables   = {};  // { 'CLIENTES': { columns:[], rows:[], meta:{} } }
+var _simDb2TablesInitial = {}; // snapshot das tabelas DB2 no momento do ▶ (para comparar no estado final)
 var _simDb2Cursors  = {};  // { 'C1': { tableName, cols, pointer, isOpen } }
 
 // Analisa o código COBOL e extrai variáveis de DATA DIVISION
@@ -82,6 +85,7 @@ function _parseWsVars(code) {
   var currentSection = '';
   var lastNon88Name = ''; // para vincular nível 88 ao pai
   var lastFdName    = ''; // FD/SD atual dentro do FILE SECTION
+  var lastFdIsSD    = false; // true quando o descritor atual é SD (Sort Description)
   lines.forEach(function(lt) {  // lt já normalizado e trimado pelo pré-processamento
     if (!lt) return;
     var lu = lt.toUpperCase();
@@ -96,7 +100,7 @@ function _parseWsVars(code) {
     // No FILE SECTION, linhas FD/SD são descritores de arquivo — extrai nome e pula
     if (inSection && currentSection === 'FILE' && /^[SF]D\s+/.test(lu)) {
       var fdLineM = lu.match(/^[SF]D\s+([A-Z][A-Z0-9-]*)/);
-      if (fdLineM) lastFdName = fdLineM[1];
+      if (fdLineM) { lastFdName = fdLineM[1]; lastFdIsSD = /^SD\s+/i.test(lu); }
       return;
     }
     if (!inSection) return;
@@ -181,9 +185,57 @@ function _parseWsVars(code) {
     }
     result.push({ level: level, name: name, pic: pic, picType: picType, len: len,
                   value: defVal !== null ? defVal : '', isGroup: isGroup, section: currentSection,
-                  fdName: (currentSection === 'FILE' ? lastFdName : '') });
+                  fdName:   (currentSection === 'FILE' ? lastFdName  : ''),
+                  isSdFile: (currentSection === 'FILE' ? lastFdIsSD  : false) });
+    // OCCURS N [TIMES]: marca occursN na entrada recém adicionada
+    var _occM = rest.match(/\bOCCURS\s+(\d+)\b/i);
+    if (_occM) {
+      result[result.length - 1].occursN = parseInt(_occM[1], 10);
+    }
+    // INDEXED BY: adiciona variável de índice sintética (inicia em 1, PIC numérica interna)
+    var _idxByM = rest.match(/\bINDEXED\s+BY\s+((?:[A-Z][A-Z0-9-]*\s*)+)/i);
+    if (_idxByM) {
+      _idxByM[1].trim().split(/\s+/).forEach(function(idxN) {
+        idxN = idxN.toUpperCase().replace(/[^A-Z0-9-]/g, '');
+        if (!idxN) return;
+        result.push({ level: 99, name: idxN, pic: 'S9(5)', picType: '9', len: 5,
+                      value: '1', isGroup: false, isIndex: true,
+                      section: currentSection, fdName: '' });
+      });
+    }
     lastNon88Name = name; // atualiza referência para próximos nível 88
   });
+
+  // ── Propaga occursN de GROUP OCCURS para seus filhos elementares ────────
+  // Ex.: "05 WS-TAB OCCURS 5." → "10 WS-TAB-KEY PIC X" herda occursN=5
+  // A propagação é O(n) — o stack nunca cresce além da profundidade hierárquica do programa.
+  // Suporta OCCURS aninhados: o filho herda o occursN do grupo pai mais próximo.
+  var _activeOccurs = []; // stack de { level, occursN, name }
+  result.forEach(function(v) {
+    if (v.isIndex) return; // índices sintéticos — não propagar
+    // Descarta do stack entradas de nível >= ao atual (sai do escopo do bloco pai)
+    while (_activeOccurs.length && _activeOccurs[_activeOccurs.length - 1].level >= v.level) {
+      _activeOccurs.pop();
+    }
+    // Item que já tem occursN próprio → empilha como raiz de OCCURS
+    if (v.occursN) {
+      _activeOccurs.push({ level: v.level, occursN: v.occursN, name: v.name });
+      return;
+    }
+    // Dentro de um OCCURS ativo: propaga para elementares e empilha grupos filhos
+    if (_activeOccurs.length) {
+      var _parentOcc = _activeOccurs[_activeOccurs.length - 1];
+      if (!v.isGroup && !v.is88) {
+        // Elementar filho: herda occursN e marca pai
+        v.occursN      = _parentOcc.occursN;
+        v.occursParent = _parentOcc.name;
+      } else if (v.isGroup) {
+        // Grupo filho sem OCCURS próprio: apenas mantém hierarquia no stack
+        _activeOccurs.push({ level: v.level, occursN: _parentOcc.occursN, name: v.name });
+      }
+    }
+  });
+
   return result;
 }
 
@@ -247,6 +299,18 @@ function _simInitVars(code) {
     } else if (!v.isGroup) {
       _simVars[v.name] = v.value;
       _simVarsInitial[v.name] = v.value;
+      // OCCURS: inicializa células individuais VAR(1)..VAR(N) para rastreamento.
+      // Para tabelas grandes (> 500 células) pré-inicializamos apenas as primeiras 500;
+      // células além desse limite são criadas sob demanda via _simSetVarInternal.
+      // A leitura usa fallback: se a chave não existe, usa v.value (valor default).
+      if (v.occursN) {
+        var _occInitMax = Math.min(v.occursN, 500);
+        for (var _oi = 1; _oi <= _occInitMax; _oi++) {
+          var _ok = v.name + '(' + _oi + ')';
+          _simVars[_ok] = v.value;
+          _simVarsInitial[_ok] = v.value;
+        }
+      }
     }
   });
   _simInitFiles();
@@ -281,7 +345,12 @@ function _simInitFiles() {
     if (v.fdName && !v.isGroup && !v.is88) {
       if (!_simFiles[v.fdName]) {
         var svName = _simFileStatusMap[v.fdName] || null;
-        _simFiles[v.fdName] = { fields: [], records: [], pointer: 0, isOpen: false, statusVarName: svName };
+        var _isSd  = !!v.isSdFile;
+        // Arquivos SD (Sort Description) são gerenciados pelo SORT — sempre "abertos"
+        _simFiles[v.fdName] = { fields: [], records: [], pointer: 0,
+                                isOpen: _isSd, isSD: _isSd,
+                                openMode: _isSd ? 'SORT' : null,
+                                statusVarName: svName };
         // Garante que a variável FILE STATUS exista em _simVars mesmo se não foi
         // declarada explicitamente no WORKING-STORAGE (PIC XX ausente ou não parseada)
         if (svName && !_simVars.hasOwnProperty(svName)) {
@@ -305,7 +374,7 @@ function _simSetFileStatus(fd, code) {
 // Executa um READ simulado: preenche variáveis ou sinaliza AT END
 function _simDoRead(labelU) {
   // Extrai nome do arquivo do label: READ ARQ-ENTRADA [INTO ...] [NEXT ...]
-  var m = labelU.match(/^READ\s+([A-Z][A-Z0-9-]*)/);
+  var m = labelU.match(/^(?:READ|RETURN)\s+([A-Z][A-Z0-9-]*)/);
   if (!m) { _simLastReadAtEnd = false; return; }
   var fdName = m[1].trim();
   var fd = _simFiles[fdName];
@@ -381,6 +450,11 @@ function _simDoOpen(labelU) {
     if (!fdName) return;
     var fd = _simFiles[fdName];
     if (!fd) return;
+    // Arquivos SD são gerenciados pelo SORT — OPEN não se aplica
+    if (fd.isSD) {
+      _simLog('ℹ OPEN ' + fdName + ' ignorado — arquivo SD gerenciado pelo SORT', 'sim-log-sort');
+      return;
+    }
     if (fd.isOpen) {
       _simSetFileStatus(fd, '41');
       _simLog('\u26a0 OPEN ' + fdName + ' \u2192 arquivo j\u00e1 est\u00e1 aberto (FS:41)', 'sim-log-branch');
@@ -407,6 +481,11 @@ function _simDoClose(labelU) {
     if (!fdName) return;
     var fd = _simFiles[fdName];
     if (!fd) return;
+    // Arquivos SD são gerenciados pelo SORT — CLOSE não se aplica
+    if (fd.isSD) {
+      _simLog('ℹ CLOSE ' + fdName + ' ignorado — arquivo SD gerenciado pelo SORT', 'sim-log-sort');
+      return;
+    }
     if (!fd.isOpen) {
       _simSetFileStatus(fd, '42');
       _simLog('\u26a0 CLOSE ' + fdName + ' \u2192 arquivo j\u00e1 estava fechado (FS:42)', 'sim-log-branch');
@@ -422,9 +501,31 @@ function _simDoClose(labelU) {
   _simRefreshFilesPanel();
 }
 
+// ── RELEASE — grava registro na área de trabalho do SORT (arquivo SD) ────
+function _simDoRelease(labelU) {
+  // Label: "RELEASE\nARQ-SORT" (gerado pelo buildAST após fix do fdMap)
+  var lines  = labelU.split(/\r?\n/);
+  var fdName = (lines[1] || lines[0]).replace(/^RELEASE\s+/i, '').trim().split(/\s+/)[0];
+  var fd = _simFiles[fdName];
+  if (!fd) {
+    _simLog('⊕ RELEASE: arquivo SD \'' + fdName + '\' não encontrado', 'sim-log-warn');
+    return;
+  }
+  var rec = {};
+  fd.fields.forEach(function(f) {
+    rec[f] = _simVars.hasOwnProperty(f) ? _simVars[f] : '';
+  });
+  fd.records.push(rec);
+  _simSetFileStatus(fd, '00');
+  if (typeof _repOnFileOp === 'function') _repOnFileOp('write', fdName);
+  _simLog('⊕ RELEASE → ' + fdName + ' reg ' + fd.records.length + ' na área de SORT', 'sim-log-sort');
+  _simRefreshFilesPanel();
+}
+
 // ── Painel de Variáveis ─────────────────────────────────────────
 // Muda a fase visual do painel: 'input' (antes de rodar) ou 'running' (em execução)
 function _simSetPanelPhase(phase) {
+  if (_simHeadless) return;
   var panel = document.getElementById('sim-vars-panel');
   var ttl   = document.querySelector('#sim-vars-panel .sim-vars-title');
   if (!panel || !ttl) return;
@@ -923,7 +1024,7 @@ function _parseDb2Tables(code) {
       var cols     = selM[1].replace(/\s+/g,'').split(',').map(function(c){ return c.trim().replace(/^:/,''); }).filter(Boolean);
       var intoVars = selM[2].replace(/\s+/g,'').split(',').map(function(v){ return v.trim().replace(/^:/,''); }).filter(Boolean);
       var tbl = selM[3];
-      if (!tables[tbl]) tables[tbl] = { columns: [], rows: [], selectMaps: [] };
+      if (!tables[tbl]) tables[tbl] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
       cols.forEach(function(c){ if (tables[tbl].columns.indexOf(c) < 0) tables[tbl].columns.push(c); });
       tables[tbl].selectMaps.push({ cols: cols, into: intoVars });
     }
@@ -931,7 +1032,7 @@ function _parseDb2Tables(code) {
     var insM = sql.match(/^INSERT\s+INTO\s+([A-Z][A-Z0-9_#@]*)\s*(?:\(([^)]+)\))?/i);
     if (insM) {
       var tbl2 = insM[1];
-      if (!tables[tbl2]) tables[tbl2] = { columns: [], rows: [], selectMaps: [] };
+      if (!tables[tbl2]) tables[tbl2] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
       if (insM[2]) {
         insM[2].split(',').forEach(function(c){
           var cn = c.trim().replace(/^:/,'');
@@ -943,7 +1044,7 @@ function _parseDb2Tables(code) {
     var updM = sql.match(/^UPDATE\s+([A-Z][A-Z0-9_#@]*)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]*))?$/i);
     if (updM) {
       var tblUpd = updM[1];
-      if (!tables[tblUpd]) tables[tblUpd] = { columns: [], rows: [], selectMaps: [] };
+      if (!tables[tblUpd]) tables[tblUpd] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
       // Colunas do SET: "NOME = :WS-NOME, SALDO = :WS-SALDO"
       (updM[2] || '').split(',').forEach(function(sa) {
         var cm = sa.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=/i);
@@ -957,25 +1058,34 @@ function _parseDb2Tables(code) {
     } else {
       // Fallback: só detecta a tabela sem colunas (UPDATE sem SET visível no label)
       var updFb = sql.match(/^UPDATE\s+([A-Z][A-Z0-9_#@]*)/i);
-      if (updFb && !tables[updFb[1]]) tables[updFb[1]] = { columns: [], rows: [], selectMaps: [] };
+      if (updFb && !tables[updFb[1]]) tables[updFb[1]] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
     }
     // DELETE FROM table WHERE col=:v — extrai colunas do WHERE
     var delM = sql.match(/^DELETE\s+FROM\s+([A-Z][A-Z0-9_#@]*)(?:\s+WHERE\s+([\s\S]*))?$/i);
     if (delM) {
       var tblDel = delM[1];
-      if (!tables[tblDel]) tables[tblDel] = { columns: [], rows: [], selectMaps: [] };
+      if (!tables[tblDel]) tables[tblDel] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
       (delM[2] || '').split(/\s+AND\s+/i).forEach(function(wc) {
         var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=/i);
         if (wm) { var cn = wm[1].trim(); if (tables[tblDel].columns.indexOf(cn) < 0) tables[tblDel].columns.push(cn); }
       });
     }
-    // SELECT WHERE — extrai colunas do WHERE também (ex: WHERE ID = :WS-ID)
+    // SELECT WHERE — extrai colunas do WHERE e mapa col→hostVar
     if (selM) {
       var tblSel = selM[3];
+      var whereMap = {};
       (selM[4] || '').split(/\s+AND\s+/i).forEach(function(wc) {
-        var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=/i);
-        if (wm) { var cn = wm[1].trim(); if (tables[tblSel] && tables[tblSel].columns.indexOf(cn) < 0) tables[tblSel].columns.push(cn); }
+        var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=\s*:([A-Z][A-Z0-9-]*)/i);
+        if (wm) {
+          var cn = wm[1].trim(), hv = wm[2].trim();
+          if (tables[tblSel] && tables[tblSel].columns.indexOf(cn) < 0) tables[tblSel].columns.push(cn);
+          whereMap[cn] = hv;
+        } else {
+          var wm2 = wc.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=/i);
+          if (wm2) { var cn2 = wm2[1].trim(); if (tables[tblSel] && tables[tblSel].columns.indexOf(cn2) < 0) tables[tblSel].columns.push(cn2); }
+        }
       });
+      if (tables[tblSel] && Object.keys(whereMap).length) tables[tblSel].whereMaps.push(whereMap);
     }
   }
   return tables;
@@ -1006,7 +1116,7 @@ function _parseDb2Cursors(code, tables) {
       var tblName    = declM[3];
       var cols = rawCols === '*' ? [] :
         rawCols.replace(/\s+/g,'').split(',').map(function(c){ return c.trim().replace(/^:/,''); }).filter(Boolean);
-      if (!tables[tblName]) tables[tblName] = { columns: [], rows: [], selectMaps: [] };
+      if (!tables[tblName]) tables[tblName] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
       cols.forEach(function(c){ if (tables[tblName].columns.indexOf(c) < 0) tables[tblName].columns.push(c); });
       // WHERE cols também
       (declM[4] || '').split(/\s+AND\s+/i).forEach(function(wc) {
@@ -1128,7 +1238,7 @@ function _simRefreshDb2Panel() {
 
 function _simDb2AddRow(tblName) {
   var tbl = _simDb2Tables[tblName];
-  if (!tbl) { _simDb2Tables[tblName] = { columns: [], rows: [], selectMaps: [] }; tbl = _simDb2Tables[tblName]; }
+  if (!tbl) { _simDb2Tables[tblName] = { columns: [], rows: [], selectMaps: [], whereMaps: [] }; tbl = _simDb2Tables[tblName]; }
   var rec = {};
   tbl.columns.forEach(function(c){ rec[c] = ''; });
   tbl.rows.push(rec);
@@ -1467,6 +1577,8 @@ function _simEvalCond(condText) {
   text = text.replace(/\.$/, '').trim();
   // Remove prefixo IF/WHEN que pode vir do label do nó
   text = text.replace(/^IF\s+/, '').replace(/^WHEN\s+/, '').trim();
+  // Normaliza "VAR (IDX)" → "VAR(IDX)" para resolver subscritos corretamente
+  text = text.replace(/\b([A-Z][A-Z0-9-]*)\s+\(([A-Z0-9][A-Z0-9-]*)\)/g, '$1($2)');
   // Tenta avaliar OR (nível mais baixo de precedência)
   var orParts = _simSplitLogical(text, 'OR');
   if (orParts.length > 1) {
@@ -1570,13 +1682,33 @@ var _SIM_FIGURATIVE = {
   'HIGH-VALUES': '\xFF', 'HIGH-VALUE': '\xFF', 'LOW-VALUES': '\x00', 'LOW-VALUE': '\x00'
 };
 
+// Resolve referência de variável: "VAR" ou "VAR(SUBSCRIPT)" → {found, value}
+// Suporte a tabelas COBOL: VAR(IDX) → resolve IDX de _simVars, tenta VAR(n) ou fallback VAR
+function _simGetVarVal(ref) {
+  ref = (ref || '').trim();
+  var subM = ref.match(/^([A-Z][A-Z0-9-]*)\(([A-Z0-9][A-Z0-9-]*)\)$/);
+  if (subM) {
+    var base = subM[1], subExpr = subM[2];
+    var subN = /^\d+$/.test(subExpr) ? subExpr
+             : (_simVars.hasOwnProperty(subExpr) ? String(Math.trunc(parseFloat(_simVars[subExpr]) || 1)) : null);
+    if (subN === null) return { found: false, value: null };
+    var ck = base + '(' + subN + ')';
+    if (_simVars.hasOwnProperty(ck))   return { found: true, value: String(_simVars[ck]) };
+    if (_simVars.hasOwnProperty(base)) return { found: true, value: String(_simVars[base]) };
+    return { found: false, value: null };
+  }
+  if (_simVars.hasOwnProperty(ref)) return { found: true, value: String(_simVars[ref]) };
+  return { found: false, value: null };
+}
+
 function _simEvalSimpleCond(text) {
   // Suporte a NUMERIC / ALPHABETIC (classe especial)
   var classicM = text.match(/^([A-Z][A-Z0-9-]*(?:\([^)]+\))?)\s+(?:(NOT)\s+)?(?:IS\s+)?(NUMERIC|ALPHABETIC|ALPHABETIC-LOWER|ALPHABETIC-UPPER)$/);
   if (classicM) {
     var cn = classicM[1], notFlag = !!classicM[2], cls = classicM[3];
-    if (!_simVars.hasOwnProperty(cn)) return null;
-    var cv = _simVars[cn];
+    var _cnRef = _simGetVarVal(cn.replace(/\s+/g,''));
+    if (!_cnRef.found) return null;
+    var cv = _cnRef.value;
     var ok;
     if (cls === 'NUMERIC')             ok = /^-?\d+(\.\d+)?$/.test(cv.trim());
     else if (cls === 'ALPHABETIC')     ok = /^[A-Za-z ]*$/.test(cv);
@@ -1608,11 +1740,12 @@ function _simEvalSimpleCond(text) {
   var varName = m[1].replace(/\s+/g, '');
   var op      = m[2].replace(/\s+/g, ' ').trim();
   var valStr  = m[3].trim().replace(/\.$/, '');
-  if (!_simVars.hasOwnProperty(varName)) {
+  var _varRef = _simGetVarVal(varName);
+  if (!_varRef.found) {
     console.warn('[COND] variável não encontrada em _simVars:', varName);
     return null;
   }
-  var varVal = _simVars[varName] !== undefined ? String(_simVars[varName]) : '';
+  var varVal = _varRef.value;
   // Parse o valor de comparação
   var cmpVal;
   if ((valStr.startsWith("'") && valStr.endsWith("'")) || (valStr.startsWith('"') && valStr.endsWith('"'))) {
@@ -1626,9 +1759,10 @@ function _simEvalSimpleCond(text) {
     }
   } else if (/^-?\d+(\.\d+)?$/.test(valStr)) {
     cmpVal = valStr;
-  } else if (/^[A-Z][A-Z0-9-]*$/.test(valStr)) {
-    // Outra variável
-    if (_simVars.hasOwnProperty(valStr)) cmpVal = _simVars[valStr];
+  } else if (/^[A-Z][A-Z0-9-]*(?:\([^)]+\))?$/.test(valStr)) {
+    // Outra variável (possivelmente subscripted: WS-VAR(IDX))
+    var _cmpRef = _simGetVarVal(valStr);
+    if (_cmpRef.found) cmpVal = _cmpRef.value;
     else return null;
   } else {
     return null;
@@ -1661,32 +1795,75 @@ function _simEvalSimpleCond(text) {
 function _simTrackSet(labelText) {
   if (!labelText) return;
   var lu = labelText.toUpperCase().replace(/\.$/,'').trim();
-  // SET VAR1 [VAR2 ...] TO TRUE|FALSE
-  var m = lu.match(/^SET\s+(.+?)\s+TO\s+(TRUE|FALSE)$/);
+
+  // SET var UP BY n  (índice: incremento)
+  var upM = lu.match(/^SET\s+([A-Z][A-Z0-9-]*)\s+UP\s+BY\s+(.+)$/);
+  if (upM) {
+    var _uN = upM[1].trim();
+    if (_simVars.hasOwnProperty(_uN)) {
+      var _uCur = parseFloat(_simVars[_uN]) || 1;
+      var _uBy  = parseFloat(upM[2]) || 1;
+      var _uNv  = String(Math.trunc(_uCur + _uBy));
+      _simSetVarInternal(_uN, _uNv);
+      _simLog('↪ SET ' + _uN + ' UP BY ' + _uBy + ' → ' + _uNv, 'sim-log-move');
+    }
+    return;
+  }
+
+  // SET var DOWN BY n  (índice: decremento)
+  var downM = lu.match(/^SET\s+([A-Z][A-Z0-9-]*)\s+DOWN\s+BY\s+(.+)$/);
+  if (downM) {
+    var _dN = downM[1].trim();
+    if (_simVars.hasOwnProperty(_dN)) {
+      var _dCur = parseFloat(_simVars[_dN]) || 1;
+      var _dBy  = parseFloat(downM[2]) || 1;
+      var _dNv  = String(Math.max(1, Math.trunc(_dCur - _dBy)));
+      _simSetVarInternal(_dN, _dNv);
+      _simLog('↪ SET ' + _dN + ' DOWN BY ' + _dBy + ' → ' + _dNv, 'sim-log-move');
+    }
+    return;
+  }
+
+  // SET VAR1 [VAR2 ...] TO value/index/TRUE/FALSE
+  var m = lu.match(/^SET\s+(.+?)\s+TO\s+(TRUE|FALSE|.+)$/);
   if (!m) return;
   var names = m[1].trim().split(/\s+/);
-  var toTrue = m[2] === 'TRUE';
+  var toVal = m[2].trim();
+  var toTrue  = toVal === 'TRUE';
+  var toFalse = toVal === 'FALSE';
   names.forEach(function(name) {
     name = name.trim();
-    // Verifica se é um nome de nível 88
-    if (_sim88Defs.hasOwnProperty(name)) {
-      var d88 = _sim88Defs[name];
-      var parent = d88.parent;
-      if (!_simVars.hasOwnProperty(parent)) return;
-      if (toTrue) {
-        // Seta pai com o primeiro valor do 88
-        var val = d88.values[0] !== undefined ? d88.values[0] : '';
-        _simSetVarInternal(parent, val);
-        _simLog('↪ SET ' + name + ' TO TRUE → ' + parent + ' ← \'' + val + '\'', 'sim-log-move');
-      } else {
-        // FALSE: limpa o pai (espaços/zeros conforme PIC)
-        _simSetVarInternal(parent, '');
-        _simLog('↪ SET ' + name + ' TO FALSE → ' + parent + ' ← \'\'', 'sim-log-move');
+    if (toTrue || toFalse) {
+      // Nível 88
+      if (_sim88Defs.hasOwnProperty(name)) {
+        var d88 = _sim88Defs[name];
+        var parent = d88.parent;
+        if (!_simVars.hasOwnProperty(parent)) return;
+        if (toTrue) {
+          var val = d88.values[0] !== undefined ? d88.values[0] : '';
+          _simSetVarInternal(parent, val);
+          _simLog('↪ SET ' + name + ' TO TRUE → ' + parent + ' ← \'' + val + '\'', 'sim-log-move');
+        } else {
+          _simSetVarInternal(parent, '');
+          _simLog('↪ SET ' + name + ' TO FALSE → ' + parent + ' ← \'\'', 'sim-log-move');
+        }
+      } else if (_simVars.hasOwnProperty(name)) {
+        _simSetVarInternal(name, toTrue ? '1' : '0');
+        _simLog('↪ SET ' + name + ' TO ' + toVal, 'sim-log-move');
       }
-    } else if (_simVars.hasOwnProperty(name)) {
-      // SET var TO TRUE/FALSE como booleano numérico (menos comum)
-      _simSetVarInternal(name, toTrue ? '1' : '0');
-      _simLog('↪ SET ' + name + ' TO ' + m[2], 'sim-log-move');
+    } else {
+      // SET índice TO literal numérico ou outra variável/índice
+      if (!_simVars.hasOwnProperty(name)) return;
+      var resolvedVal;
+      if (/^\d+$/.test(toVal)) {
+        resolvedVal = toVal;
+      } else if (_simVars.hasOwnProperty(toVal)) {
+        resolvedVal = _simVars[toVal];
+      } else {
+        return;
+      }
+      _simSetVarInternal(name, resolvedVal);
+      _simLog('↪ SET ' + name + ' ← ' + resolvedVal, 'sim-log-move');
     }
   });
 }
@@ -1698,6 +1875,10 @@ function _simTrackMove(labelText) {
   var m = lu.match(/^MOVE\s+(.+?)\s+TO\s+(.+)$/);
   if (!m) return;
   var src = m[1].trim(), destStr = m[2].trim().replace(/\.$/, '');
+  // Normaliza "VAR ( SUB )" → "VAR(SUB)" para não quebrar o split
+  destStr = destStr.replace(/\b([A-Z][A-Z0-9-]*)\s+\(([^)]+)\)/g, function(_, v, s) {
+    return v + '(' + s.replace(/\s+/g, '') + ')';
+  });
   // Múltiplos destinos separados por espaço (ex: MOVE X TO A B C)
   var dests = destStr.split(/\s+/);
   // Resolve valor fonte
@@ -1714,7 +1895,22 @@ function _simTrackMove(labelText) {
     return; // não consegue resolver
   }
   dests.forEach(function(dest) {
-    dest = dest.replace(/\.$/, '');
+    dest = dest.replace(/\.$/, '').replace(/\s+/g, '');
+    // Suporte a destino subscriptado: "DEST(IDX)" ou "DEST (IDX)"
+    var destSubM = dest.match(/^([A-Z][A-Z0-9-]*)\(([A-Z0-9][A-Z0-9-]*)\)$/);
+    if (destSubM) {
+      var _dBase = destSubM[1], _dSub = destSubM[2];
+      var _dIdxN = /^\d+$/.test(_dSub) ? _dSub
+                 : (_simVars.hasOwnProperty(_dSub) ? String(Math.trunc(parseFloat(_simVars[_dSub]) || 1)) : null);
+      if (_dIdxN !== null) {
+        var _dKey = _dBase + '(' + _dIdxN + ')';
+        _simSetVarInternal(_dKey, srcVal);
+        // Atualiza também a chave base (valor "corrente" da tabela)
+        if (_simVars.hasOwnProperty(_dBase)) _simSetVarInternal(_dBase, srcVal);
+        _simLog('↪ ' + _dBase + '(' + _dIdxN + ') ← \'' + srcVal + '\'', 'sim-log-move');
+      }
+      return;
+    }
     if (/^[A-Z][A-Z0-9-]*$/.test(dest) && _simVars.hasOwnProperty(dest)) {
       _simSetVarInternal(dest, srcVal);
       _simLog('↪ ' + dest + ' ← \'' + srcVal + '\'', 'sim-log-move');
@@ -2100,7 +2296,7 @@ function _simExecuteSql(sqlLabel) {
         _simDb2Cursors[_declCurName] = { tableName: _declTblName, cols: _declCols, pointer: 0, isOpen: false, intoVars: _existInto };
       }
       if (!_simDb2Tables[_declTblName]) {
-        _simDb2Tables[_declTblName] = { columns: _declCols.slice(), rows: [], meta: {} };
+        _simDb2Tables[_declTblName] = { columns: _declCols.slice(), rows: [], meta: {}, selectMaps: [], whereMaps: [] };
       }
     }
     _simSetVarInternal('SQLCODE', '0');
@@ -2257,7 +2453,7 @@ function _simExecuteSql(sqlLabel) {
     var tblName2 = insM[1];
     // Cria a tabela automaticamente se não existir no painel
     if (!_simDb2Tables[tblName2]) {
-      _simDb2Tables[tblName2] = { columns: [], rows: [], selectMaps: [] };
+      _simDb2Tables[tblName2] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
       _simLog('\u23cb SQL INSERT: tabela ' + tblName2 + ' criada automaticamente', 'sim-log-info');
     }
     var tbl2 = _simDb2Tables[tblName2];
@@ -2491,11 +2687,13 @@ function _simLog(msg, cls) {
 }
 
 function _simStepInfo() {
+  if (_simHeadless) return;
   var el = document.getElementById('sim-step-info');
   if (el) el.textContent = 'Passo ' + _sim.step + (_sim.callStack.length ? '  ⬡×' + _sim.callStack.length : '');
 }
 
 function _simUpdateStack() {
+  if (_simHeadless) return;
   var wrap = document.getElementById('sim-stack-wrap');
   var items = document.getElementById('sim-stack-items');
   if (!wrap || !items) return;
@@ -2527,6 +2725,7 @@ function _simHighlight(nodeId) {
   var node = cy.getElementById(nodeId);
   node.removeClass('sim-visited');
   node.addClass('sim-current');
+  if (_simHeadless) return; // skip pan/animate in headless mode
   // Pan/zoom para manter o nó visível
   cy.animate({ center: { eles: node }, zoom: Math.max(cy.zoom(), 0.75) }, { duration: 180 });
 }
@@ -2605,6 +2804,11 @@ var _simRestartDecide = function(choice) {
 };
 
 function _simStopExecute(close, keepState) {
+  // Desativa modo fake ao parar
+  if (typeof _fakeSimActive !== 'undefined') {
+    _fakeSimActive        = false;
+    _fakeSimBranchQueueIdx = 0;
+  }
   _simClear();
   if (close) {
     _sim.on = false;
@@ -2658,6 +2862,7 @@ function _simFindRoot() {
 }
 
 function _simSetButtons(state) {
+  if (_simHeadless) return;
   var play  = document.getElementById('sim-btn-play');
   var pause = document.getElementById('sim-btn-pause');
   var step  = document.getElementById('sim-btn-step');
@@ -3002,6 +3207,51 @@ function _simAdvance() {
         // Usa detail (SQL completo) quando disponível; shortLabel serve só como fallback
         _simExecuteSql(curNode.data('detail') || curNode.data('label') || '');
       }
+      // SORT nodes: log de contexto
+      if (tipo === 'sort') {
+        var _sortLblSim = (curNode.data('label') || '').replace(/\r?\n/g,' ');
+        var _sortFile   = curNode.data('sortFile') || '';
+        _simLog('⇅ SORT: ' + _sortFile + ' — ordenando registros…', 'sim-log-sort');
+      }
+      if (tipo === 'sort-input') {
+        var _inProcName = (curNode.data('target') || '').trim();
+        _simLog('→ INPUT PROCEDURE: ' + (_inProcName || 'proc') + '  (alimenta SORT via RELEASE)', 'sim-log-sort');
+      }
+      if (tipo === 'sort-engine') {
+        _simLog('⚙ ENGINE SORT (DFSORT/SYNCSORT) — processando ordenação…', 'sim-log-sort');
+        // Ordena os registros da área SD pelas chaves definidas no SORT
+        var _seFile = curNode.data('sortFile') || '';
+        var _seKeysJ = curNode.data('sortKeys') || '[]';
+        var _seFd = _simFiles[_seFile];
+        if (_seFd && _seFd.records.length > 0) {
+          var _seKeys = [];
+          try { _seKeys = JSON.parse(_seKeysJ); } catch(e) {}
+          if (_seKeys.length > 0) {
+            _seFd.records.sort(function(a, b) {
+              for (var _ki = 0; _ki < _seKeys.length; _ki++) {
+                var _dir  = (_seKeys[_ki].dir === 'D') ? -1 : 1;
+                var _kFld = _seKeys[_ki].field || '';
+                var _av   = a[_kFld] !== undefined ? String(a[_kFld]) : '';
+                var _bv   = b[_kFld] !== undefined ? String(b[_kFld]) : '';
+                if (_av !== _bv) return _dir * (_av < _bv ? -1 : 1);
+              }
+              return 0;
+            });
+          }
+          _seFd.pointer = 0; // reseta ponteiro para leitura via RETURN
+          _simLog('⚙ SORT: ' + _seFd.records.length + ' registros ordenados em ' + _seFile, 'sim-log-sort');
+          _simRefreshFilesPanel();
+        }
+      }
+      if (tipo === 'sort-output') {
+        var _outProcName = (curNode.data('target') || '').trim();
+        _simLog('← OUTPUT PROCEDURE: ' + (_outProcName || 'proc') + '  (consome SORT via RETURN)', 'sim-log-sort');
+      }
+      if (tipo === 'search') {
+        var _srchLblSim = (curNode.data('label') || '').replace(/\r?\n/g,' ');
+        var _srchIsAll  = curNode.data('searchAll') === 'true';
+        _simLog('🔍 ' + (_srchIsAll ? 'SEARCH ALL' : 'SEARCH') + ': ' + _srchLblSim + ' — buscando na tabela interna…', 'sim-log-search');
+      }
       var _pendIoLbl    = null;
       var _pendWriteLbl = null, _pendWriteVerb = null;
       if (tipo === 'io') {
@@ -3015,8 +3265,11 @@ function _simAdvance() {
       _simHighlight(nexts[0].id());
       _simLogNode(nexts[0].id());
       // READ e WRITE executam após o log para que a mensagem apareça por último
-      if (_pendIoLbl    !== null && /^READ\b/.test(_pendIoLbl)) _simDoRead(_pendIoLbl);
-      if (_pendWriteLbl !== null) _simDoWrite(_pendWriteLbl, _pendWriteVerb === 'REWRITE');
+      if (_pendIoLbl !== null && /^(?:READ|RETURN)\b/.test(_pendIoLbl)) _simDoRead(_pendIoLbl);
+      if (_pendWriteLbl !== null) {
+        if (_pendWriteVerb === 'RELEASE') _simDoRelease(_pendWriteLbl);
+        else _simDoWrite(_pendWriteLbl, _pendWriteVerb === 'REWRITE');
+      }
       _simStepInfo();
       _simCheckBreak(nexts[0].id(), resolve);
       return;
@@ -3032,15 +3285,17 @@ function _simAdvance() {
       if (condNorm === 'AT END?' || condNorm === 'INVALID KEY?') {
         evalResult = _simLastReadAtEnd;
       } else {
-        // DEBUG: extrai nome de variável da condição para mostrar seu valor atual
-        var _dbgVarM = condNorm.replace(/^IF\s+/,'').match(/^([A-Z][A-Z0-9-]*)/);
+        // DEBUG: extrai nome (+ subscript opcional) da condição para mostrar valor atual
+        var _dbgVarM = condNorm.replace(/^(?:IF|WHEN)\s+/,'').match(/^([A-Z][A-Z0-9-]*)(\s*\([^)]+\))?/);
         if (_dbgVarM) {
-          var _dbgVn = _dbgVarM[1];
-          var _dbgHas = _simVars.hasOwnProperty(_dbgVn);
-          var _dbgVal = _dbgHas ? _simVars[_dbgVn] : '(NÃO ESTÁ EM _simVars)';
-          _simLog('🔍 DEBUG IF: ' + _dbgVn + ' = ' + JSON.stringify(_dbgVal) + (_dbgHas ? '' : ' ← variável não foi inicializada!'), 'sim-log-branch');
+          var _dbgFull = (_dbgVarM[1] + (_dbgVarM[2] ? _dbgVarM[2].replace(/\s+/g,'') : '')).trim();
+          var _dbgRef  = _simGetVarVal(_dbgFull);
+          var _dbgHas  = _dbgRef.found;
+          var _dbgVal  = _dbgHas ? _dbgRef.value : '(NÃO ESTÁ EM _simVars)';
+          _simLog('🔍 DEBUG IF: ' + _dbgFull + ' = ' + JSON.stringify(_dbgVal) + (_dbgHas ? '' : ' ← variável não foi inicializada!'), 'sim-log-branch');
           // Se não está em _simVars mas deveria ser FILE STATUS, mostra dica
           if (!_dbgHas) {
+            var _dbgVn    = _dbgVarM[1]; // nome base sem subscript para busca no mapa
             var _dbgFsVars = Object.values(_simFileStatusMapDebug);
             if (_dbgFsVars.indexOf(_dbgVn) >= 0) {
               _simLog('🔍 DEBUG: ' + _dbgVn + ' é FILE STATUS de ' + Object.keys(_simFileStatusMapDebug).find(function(k){return _simFileStatusMapDebug[k]===_dbgVn;}) + ' — mas o OPEN ainda não rodou ou parser falhou', 'sim-log-error');
@@ -3096,9 +3351,24 @@ function _simAdvance() {
       // Não conseguiu avaliar → pede ao usuário
       var _dbgCond = condText.replace(/\r?\n/g,' ').trim();
       // Mostra variáveis da condição e seus valores para diagnóstico
-      var _dbgVarsInCond = _dbgCond.toUpperCase().match(/\b[A-Z][A-Z0-9-]{2,}\b/g) || [];
-      var _dbgVarInfo = _dbgVarsInCond.filter(function(v,i,a){return a.indexOf(v)===i;}).map(function(v){
-        return v + '=' + (_simVars.hasOwnProperty(v) ? JSON.stringify(_simVars[v]) : '⚠NÃO EXISTE');
+      var _cobolKws = /^(WHEN|IF|AND|OR|NOT|IS|TO|BY|IN|OF|AT|END|EQUAL|GREATER|LESS|THAN|TRUE|FALSE|NUMERIC|ALPHABETIC|SPACE|SPACES|ZERO|ZEROS|ZEROES|HIGH|LOW|VALUE|NEXT|SENTENCE|CONTINUE)$/;
+      // Normaliza espaços antes de subscritos na condição e remove prefixo IF/WHEN
+      var _dbgCondU = _dbgCond.toUpperCase()
+        .replace(/^(?:IF|WHEN)\s+/, '')
+        .replace(/\b([A-Z][A-Z0-9-]*)\s+\(([A-Z0-9][A-Z0-9-]*)\)/g, '$1($2)');
+      // Extrai referências VAR(SUBSCRIPT) e VAR simples, filtra keywords COBOL
+      var _dbgRefs = [];
+      var _dbgRefRe = /\b([A-Z][A-Z0-9-]{1,})(?:\([A-Z0-9][A-Z0-9-]*\))?/g;
+      var _dbgRefM;
+      while ((_dbgRefM = _dbgRefRe.exec(_dbgCondU)) !== null) {
+        var _dbgRefFull = _dbgRefM[0];
+        if (!_cobolKws.test(_dbgRefM[1]) && _dbgRefs.indexOf(_dbgRefFull) === -1) {
+          _dbgRefs.push(_dbgRefFull);
+        }
+      }
+      var _dbgVarInfo = _dbgRefs.map(function(ref) {
+        var resolved = _simGetVarVal(ref);
+        return ref + '=' + (resolved.found ? JSON.stringify(resolved.value) : '⚠NÃO EXISTE');
       }).join(', ');
       _simLog('⬦ IF não avaliado automaticamente: ' + _dbgCond.substring(0, 60), 'sim-log-branch');
       _simLog('   Variáveis na condição: ' + (_dbgVarInfo || '(nenhuma reconhecida)'), 'sim-log-error');
@@ -3290,6 +3560,31 @@ function _simRestoreSession(data) {
 
 // Modal de escolha de ramo
 function _simAskBranch(nexts, fromNode) {
+  // ── MODO FAKE: escolhe automaticamente da fila de desvios ──────
+  if (typeof _fakeSimActive !== 'undefined' && _fakeSimActive
+      && typeof _fakeSimBranchQueue !== 'undefined'
+      && _fakeSimBranchQueueIdx < _fakeSimBranchQueue.length) {
+    var qe = _fakeSimBranchQueue[_fakeSimBranchQueueIdx];
+    if (qe.nodeId === fromNode.id()) {
+      _fakeSimBranchQueueIdx++;
+      var autoChosen = nexts.find(function(n) { return n.id() === qe.chosenEdge; });
+      if (autoChosen) {
+        _simLog('🎭 Auto-desvio: ' + (qe.edgeLabel || '?'), 'sim-log-branch');
+        return Promise.resolve(autoChosen);
+      }
+    }
+    // Nó não encontrado na fila — tenta próxima entrada (pode ter sido pulado por auto-eval)
+    _fakeSimBranchQueueIdx++;
+    if (_fakeSimBranchQueueIdx < _fakeSimBranchQueue.length) {
+      var qe2 = _fakeSimBranchQueue[_fakeSimBranchQueueIdx - 1];
+      var ac2 = nexts.find(function(n) { return n.id() === qe2.chosenEdge; });
+      if (ac2) {
+        _simLog('🎭 Auto-desvio (sync): ' + (qe2.edgeLabel || '?'), 'sim-log-branch');
+        return Promise.resolve(ac2);
+      }
+    }
+  }
+  // ── MODO NORMAL ────────────────────────────────────────────────
   return new Promise(function(resolve) {
     var modal = document.getElementById('sim-branch-modal');
     var condEl = document.getElementById('sim-branch-cond');
@@ -3325,12 +3620,275 @@ function _closeBranchModal() {
   if (_sim._branchResolve) { _sim._branchResolve(); _sim._branchResolve = null; }
 }
 
+// ── Snapshot completo de variáveis, tabelas e arquivos ────────────
+// isBefore=true → estado inicial; isBefore=false → estado final (somente alterações)
+function _simLogFullState(isBefore) {
+  var SEP = '─'.repeat(52);
+  _simLog(SEP, 'sim-log-sep');
+  _simLog(isBefore ? '📊 ESTADO INICIAL' : '📊 ESTADO FINAL', 'sim-log-section');
+
+  // ── Coleta vars por categoria ────────────────────────────────
+  // occursVarNames: inclui tanto os próprios itens OCCURS quanto seus filhos herdados
+  var occursVarNames = {};
+  _simVarDefs.forEach(function(v) { if (v.occursN) occursVarNames[v.name] = v.occursN; });
+
+  var normalVars = _simVarDefs.filter(function(v) {
+    return !v.isGroup && !v.is88 && !v.isIndex && !occursVarNames[v.name]
+        && v.fdName === '' && v.section !== 'FILE';
+  });
+  var indexVars  = _simVarDefs.filter(function(v) { return !!v.isIndex; });
+  // Mostra apenas os itens OCCURS raiz (sem occursParent) — grupos e elementares diretos
+  var occursVars = _simVarDefs.filter(function(v) {
+    return !!v.occursN && !v.occursParent && !v.isIndex;
+  });
+
+  // ── VARIÁVEIS ────────────────────────────────────────────────
+  // Para programas muito grandes, limita a exibição de variáveis inalteradas
+  var _VARS_PREVIEW    = 50;  // máx vars mostradas no ESTADO INICIAL
+  var _VARS_UNCH_MAX   = 20;  // máx vars inalteradas no ESTADO FINAL
+  if (normalVars.length) {
+    if (isBefore) {
+      _simLog('  📋 VARIÁVEIS', 'sim-log-section');
+      var maxNmB = normalVars.reduce(function(m, v){ return Math.max(m, v.name.length); }, 0);
+      var shownB = Math.min(normalVars.length, _VARS_PREVIEW);
+      normalVars.slice(0, shownB).forEach(function(v) {
+        var val = _simVarsInitial.hasOwnProperty(v.name) ? _simVarsInitial[v.name]
+                : (_simVars.hasOwnProperty(v.name) ? _simVars[v.name] : '');
+        var pad = ' '.repeat(Math.max(0, maxNmB - v.name.length));
+        _simLog('    ' + v.name + pad + '  = ' + JSON.stringify(String(val)), 'sim-log-var');
+      });
+      if (normalVars.length > shownB) {
+        _simLog('    … mais ' + (normalVars.length - shownB) + ' variável(is)', 'sim-log-detail');
+      }
+    } else {
+      _simLog('  📋 VARIÁVEIS  (antes → depois)', 'sim-log-section');
+      var maxNmF = normalVars.reduce(function(m, v){ return Math.max(m, v.name.length); }, 0);
+      var changedVars   = [];
+      var unchangedVars = [];
+      normalVars.forEach(function(v) {
+        var ini = _simVarsInitial.hasOwnProperty(v.name) ? String(_simVarsInitial[v.name]) : '';
+        var cur = _simVars.hasOwnProperty(v.name) ? String(_simVars[v.name]) : ini;
+        if (ini !== cur) changedVars.push({ v: v, ini: ini, cur: cur });
+        else unchangedVars.push({ v: v, cur: cur });
+      });
+      changedVars.forEach(function(e) {
+        var pad = ' '.repeat(Math.max(0, maxNmF - e.v.name.length));
+        _simLog('    ' + e.v.name + pad + '  ' + JSON.stringify(e.ini) + ' \u2192 ' + JSON.stringify(e.cur) + '  \u25c4', 'sim-log-var');
+      });
+      var shownU = Math.min(unchangedVars.length, _VARS_UNCH_MAX);
+      unchangedVars.slice(0, shownU).forEach(function(e) {
+        var pad = ' '.repeat(Math.max(0, maxNmF - e.v.name.length));
+        _simLog('    ' + e.v.name + pad + '  = ' + JSON.stringify(e.cur), 'sim-log-var');
+      });
+      if (unchangedVars.length > shownU) {
+        _simLog('    … mais ' + (unchangedVars.length - shownU) + ' variável(is) sem alteração', 'sim-log-detail');
+      }
+    }
+  }
+
+  // ── TABELAS INTERNAS (OCCURS) ────────────────────────────────
+  if (occursVars.length) {
+    _simLog('  📋 TABELAS INTERNAS', 'sim-log-section');
+    // Limite de exibição para tabelas grandes: mostra no máx. este nº de células inalteradas
+    var _OCCURS_PREVIEW = 5;
+    occursVars.forEach(function(v) {
+      var n = v.occursN;
+      // localiza índice associado (isIndex, section igual)
+      var idx = indexVars.find(function(iv){ return iv.section === v.section; });
+      var idxLabel = idx ? ' — ' + idx.name + '=' + (_simVars[idx.name] || '1') : '';
+      _simLog('    ' + v.name + '  OCCURS ' + n + idxLabel, 'sim-log-var');
+
+      // helper: exibe células de um campo filho/elementar
+      // Para suportar programas muito grandes: itera apenas as células que existem em
+      // _simVars/_simVarsInitial (para achar alteradas), mais as primeiras _OCCURS_PREVIEW
+      // células para o snapshot de estado inicial. Evita loop até occursN quando occursN>>500.
+      function _logCells(fieldName, defVal, indent) {
+        if (isBefore) {
+          // Estado inicial: mostra apenas as primeiras _OCCURS_PREVIEW células
+          var shown = Math.min(n, _OCCURS_PREVIEW);
+          for (var si = 1; si <= shown; si++) {
+            var ck2 = fieldName + '(' + si + ')';
+            var v2 = _simVars.hasOwnProperty(ck2) ? String(_simVars[ck2]) : String(defVal);
+            _simLog(indent + '[' + si + '] = ' + JSON.stringify(v2), 'sim-log-var');
+          }
+          if (n > shown) {
+            _simLog(indent + '\u2026 mais ' + (n - shown) + ' c\u00e9lula(s)', 'sim-log-detail');
+          }
+          return;
+        }
+        // Estado final: varre apenas as chaves existentes em _simVars para detectar alterações
+        var changedCells = [];
+        var existingUnchanged = [];
+        // Coleta todas as chaves VAR(i) existentes para este campo
+        var _allKeys = Object.keys(_simVars).filter(function(k) {
+          return k.indexOf(fieldName + '(') === 0 && k[k.length - 1] === ')';
+        });
+        _allKeys.forEach(function(ck) {
+          var cur = String(_simVars[ck]);
+          var ini = _simVarsInitial.hasOwnProperty(ck) ? String(_simVarsInitial[ck]) : String(defVal);
+          var idxM = ck.match(/\((\d+)\)$/);
+          var idx = idxM ? parseInt(idxM[1], 10) : 0;
+          if (ini !== cur) {
+            changedCells.push({ i: idx, ini: ini, cur: cur });
+          } else {
+            existingUnchanged.push({ i: idx, cur: cur });
+          }
+        });
+        // Ordena por índice numérico
+        changedCells.sort(function(a, b){ return a.i - b.i; });
+        existingUnchanged.sort(function(a, b){ return a.i - b.i; });
+        if (changedCells.length === 0) {
+          _simLog(indent + '(sem altera\u00e7\u00f5es)', 'sim-log-detail');
+        } else {
+          changedCells.forEach(function(c) {
+            _simLog(indent + '[' + c.i + ']  ' + JSON.stringify(c.ini) + ' \u2192 ' + JSON.stringify(c.cur) + '  \u25c4', 'sim-log-var');
+          });
+          var shownUnch = Math.min(existingUnchanged.length, _OCCURS_PREVIEW);
+          existingUnchanged.slice(0, shownUnch).forEach(function(c) {
+            _simLog(indent + '[' + c.i + '] = ' + JSON.stringify(c.cur), 'sim-log-var');
+          });
+          var totalUnch = existingUnchanged.length + (n - _allKeys.length); // inclui não-inicializadas
+          if (totalUnch > shownUnch) {
+            _simLog(indent + '\u2026 mais ' + (totalUnch - shownUnch) + ' c\u00e9lula(s) sem altera\u00e7\u00e3o', 'sim-log-detail');
+          }
+        }
+      }
+
+      if (v.isGroup) {
+        // GRUPO OCCURS: exibe cada campo filho
+        var children = _simVarDefs.filter(function(c) {
+          return !c.isGroup && !c.is88 && !c.isIndex && c.occursParent === v.name;
+        });
+        children.forEach(function(child) {
+          _simLog('      ┌ ' + child.name, 'sim-log-detail');
+          _logCells(child.name, child.value, '        ');
+        });
+        if (!children.length) {
+          _simLog('      (nenhum campo filho detectado)', 'sim-log-detail');
+        }
+      } else {
+        // ELEMENTAR OCCURS: células diretas
+        _logCells(v.name, v.value, '      ');
+      }
+    });
+  }
+
+  // ── ÍNDICES ──────────────────────────────────────────────────
+  if (indexVars.length) {
+    if (isBefore) {
+      _simLog('  📋 ÍNDICES', 'sim-log-section');
+      indexVars.forEach(function(iv) {
+        var val = _simVarsInitial.hasOwnProperty(iv.name) ? _simVarsInitial[iv.name]
+                : (_simVars.hasOwnProperty(iv.name) ? _simVars[iv.name] : '1');
+        _simLog('    ' + iv.name + '  = ' + val, 'sim-log-var');
+      });
+    } else {
+      _simLog('  📋 ÍNDICES', 'sim-log-section');
+      indexVars.forEach(function(iv) {
+        var ini = _simVarsInitial.hasOwnProperty(iv.name) ? String(_simVarsInitial[iv.name]) : '1';
+        var cur = _simVars.hasOwnProperty(iv.name) ? String(_simVars[iv.name]) : ini;
+        if (ini !== cur) {
+          _simLog('    ' + iv.name + '  ' + JSON.stringify(ini) + ' → ' + JSON.stringify(cur) + '  ◄', 'sim-log-var');
+        } else {
+          _simLog('    ' + iv.name + '  = ' + cur, 'sim-log-var');
+        }
+      });
+    }
+  }
+
+  // ── ARQUIVOS ─────────────────────────────────────────────────
+  var fdKeys = Object.keys(_simFiles || {});
+  if (fdKeys.length) {
+    _simLog('  📂 ARQUIVOS', 'sim-log-section');
+    fdKeys.forEach(function(fdName) {
+      var fd   = _simFiles[fdName];
+      var recs = fd.records || [];
+      var mode = fd.openMode ? fd.openMode : (fd.isOpen ? 'ABERTO' : 'FECHADO');
+      _simLog('    ' + fdName + '  [' + mode + ']  ' + recs.length + ' registro(s)', 'sim-log-var');
+      recs.slice(0, 5).forEach(function(rec) {
+        var line = typeof rec === 'string' ? rec : JSON.stringify(rec);
+        if (line.length > 90) line = line.slice(0, 87) + '…';
+        _simLog('      ' + line, 'sim-log-detail');
+      });
+      if (recs.length > 5) _simLog('      … mais ' + (recs.length - 5) + ' registro(s)', 'sim-log-detail');
+    });
+  }
+
+  // ── BANCO DE DADOS (DB2) ─────────────────────────────────────
+  var db2Keys = Object.keys(_simDb2Tables || {}).filter(function(t) {
+    return (_simDb2Tables[t].columns || []).length > 0;
+  });
+  if (db2Keys.length) {
+    _simLog('  🛢 BANCO DE DADOS', 'sim-log-section');
+    db2Keys.forEach(function(tblName) {
+      var tbl  = _simDb2Tables[tblName];
+      var rows = tbl.rows || [];
+      _simLog('    ' + tblName + '  ' + rows.length + ' linha(s)', 'sim-log-var');
+      if (isBefore) {
+        // Estado inicial: mostra todas as linhas
+        rows.slice(0, 5).forEach(function(row) {
+          var cols = tbl.columns.map(function(c){ return c + '=' + JSON.stringify(row[c] !== undefined ? row[c] : ''); }).join('  ');
+          if (cols.length > 100) cols = cols.slice(0, 97) + '…';
+          _simLog('      ' + cols, 'sim-log-detail');
+        });
+        if (rows.length > 5) _simLog('      … mais ' + (rows.length - 5) + ' linha(s)', 'sim-log-detail');
+      } else {
+        // Estado final: compara com snapshot inicial
+        var initRows = (_simDb2TablesInitial && _simDb2TablesInitial[tblName])
+                     ? (_simDb2TablesInitial[tblName].rows || []) : [];
+        var maxLen = Math.max(rows.length, initRows.length);
+        var anyChange = false;
+        for (var ri = 0; ri < maxLen; ri++) {
+          var rowCur  = rows[ri];
+          var rowIni  = initRows[ri];
+          if (ri >= rows.length) {
+            // linha removida
+            var colsRem = tbl.columns.map(function(c){ return c + '=' + JSON.stringify(rowIni[c] !== undefined ? rowIni[c] : ''); }).join('  ');
+            _simLog('      [linha ' + (ri+1) + '] REMOVIDA: ' + colsRem.slice(0,90), 'sim-log-detail');
+            anyChange = true;
+          } else if (ri >= initRows.length) {
+            // linha inserida
+            var colsIns = tbl.columns.map(function(c){ return c + '=' + JSON.stringify(rowCur[c] !== undefined ? rowCur[c] : ''); }).join('  ');
+            _simLog('      [linha ' + (ri+1) + '] INSERIDA: ' + colsIns.slice(0,90) + '  ◄', 'sim-log-detail');
+            anyChange = true;
+          } else {
+            // verifica diferenças coluna a coluna
+            var diffs = tbl.columns.filter(function(c){ return String(rowCur[c]||'') !== String(rowIni[c]||''); });
+            if (diffs.length) {
+              var diffStr = diffs.map(function(c){ return c + ': ' + JSON.stringify(String(rowIni[c]||'')) + ' → ' + JSON.stringify(String(rowCur[c]||'')); }).join('  ');
+              _simLog('      [linha ' + (ri+1) + '] ' + diffStr + '  ◄', 'sim-log-detail');
+              anyChange = true;
+            } else {
+              var colsCur = tbl.columns.map(function(c){ return c + '=' + JSON.stringify(rowCur[c] !== undefined ? rowCur[c] : ''); }).join('  ');
+              _simLog('      [linha ' + (ri+1) + '] ' + colsCur.slice(0,90), 'sim-log-detail');
+            }
+          }
+        }
+        if (maxLen === 0) _simLog('      (tabela vazia)', 'sim-log-detail');
+        else if (!anyChange) _simLog('      (sem alterações)', 'sim-log-detail');
+      }
+    });
+  }
+
+  _simLog(SEP, 'sim-log-sep');
+}
+
 // PLAY: execução automática
 function simPlay() {
   // Salva snapshot dos valores que o usuário digitou como estado inicial
   _simVarDefs.forEach(function(v) { if (!v.isGroup) _simVarsInitial[v.name] = _simVars[v.name] !== undefined ? _simVars[v.name] : v.value; });
   _simVarsMoved = {};
+  // Salva snapshot das tabelas DB2 para comparar no ESTADO FINAL
+  _simDb2TablesInitial = {};
+  Object.keys(_simDb2Tables).forEach(function(tbl) {
+    var t = _simDb2Tables[tbl];
+    _simDb2TablesInitial[tbl] = {
+      columns: (t.columns || []).slice(),
+      rows: (t.rows || []).map(function(r) { return Object.assign({}, r); })
+    };
+  });
   if (typeof _repStartRun === 'function') _repStartRun();
+  _simLogFullState(true);
   _simSetPanelPhase('running');
   _sim.running = true;
   _sim.paused  = false;
@@ -3342,17 +3900,20 @@ function _simLoop() {
   if (!_sim.running) return;
   _simAdvance().then(function(ok) {
     if (ok === true) {
-      _sim.timer = setTimeout(_simLoop, _simSpeed());
+      _sim.timer = setTimeout(_simLoop, _simHeadless ? 0 : _simSpeed());
     } else if (ok === 'break') {
-      // Breakpoint: pausa
+      // Breakpoint: pausa (ignorado em headless, trata como fim)
       _sim.running = false;
-      _sim.paused  = true;
-      if (typeof _repEndRun === 'function') _repEndRun('breakpoint');
+      _sim.paused  = !_simHeadless;
+      if (typeof _repEndRun === 'function') _repEndRun(_simHeadless ? 'concluido' : 'breakpoint');
       _simSetButtons('paused');
+      if (_simHeadless && _simOnRunComplete) { var _cb = _simOnRunComplete; _simOnRunComplete = null; _cb(); }
     } else {
       _sim.running = false;
+      _simLogFullState(false);
       if (typeof _repEndRun === 'function') _repEndRun('concluido');
       _simSetButtons('ended');
+      if (_simHeadless && _simOnRunComplete) { var _cb2 = _simOnRunComplete; _simOnRunComplete = null; _cb2(); }
     }
   });
 }
