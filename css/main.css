@@ -6014,6 +6014,13 @@ body:not(.dark-mode) .rep-stats-bar-fill--var { background: linear-gradient(90de
   font-size: 12px; color: #6b7280; font-style: italic; text-align: center;
 }
 .fake-sim-loading { color: #a5b4fc; }
+.fsl-spinner {
+  display: inline-block; width: 14px; height: 14px;
+  border: 2px solid #3b3b5c; border-top-color: #a5b4fc;
+  border-radius: 50%; animation: fsl-spin 0.7s linear infinite;
+  vertical-align: middle; margin-right: 8px;
+}
+@keyframes fsl-spin { to { transform: rotate(360deg); } }
 
 /* Footer */
 .fake-sim-footer {

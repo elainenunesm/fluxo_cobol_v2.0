@@ -221,10 +221,13 @@ function bkDrop(e) {
 function bkLoadFile(file, forceNew) {
   const reader = new FileReader();
   reader.onload = ev => {
-    // Limita cada linha à coluna 72 (cols 73-80 = área de identificação COBOL — versão, seq, etc.)
+    // Limita à coluna 72 APENAS linhas no formato fixo COBOL (início com dígito = área de sequência).
+    // Linhas formato livre (início com espaço/letra) não são truncadas pois podem ter código
+    // legítimo além da coluna 72 (REDEFINES, USAGE, VALUE longos, etc.).
     const rawText = ev.target.result || '';
     const src = rawText.split(/\r\n|\r|\n/)
-      .map(l => l.length > 72 ? l.substring(0, 72) : l)
+      .map(l => (l.length > 72 && l.length >= 7 && l[0] >= '0' && l[0] <= '9')
+            ? l.substring(0, 72) : l)
       .join('\n');
     const m01  = src.match(/\b01\s+([\w-]+)/i);
     const name = m01 ? m01[1].toUpperCase() : file.name.replace(/\.[^.]+$/, '').toUpperCase();

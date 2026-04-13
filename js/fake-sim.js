@@ -46,17 +46,23 @@ function fakeSimOpen() {
 
   document.getElementById('fake-sim-overlay').classList.add('open');
   document.getElementById('fake-sim-paths-list').innerHTML =
-    '<div class="fake-sim-loading">⏳ Analisando caminhos do fluxo...</div>';
+    '<div class="fake-sim-loading"><span class="fsl-spinner"></span><span id="fsl-status">Iniciando análise…</span></div>';
   document.getElementById('fake-sim-path-count').textContent = '';
   document.getElementById('fake-sim-vars-preview').innerHTML = '';
   document.getElementById('fake-sim-filter-bar').innerHTML   = '';
   _fakeSimActiveFilter = 'all';
 
-  setTimeout(function () {
-    _fakeSimPaths = _fakeSimDiscoverPaths();
-    _fakeSimRenderFilterBar();
-    _fakeSimRenderPathList();
-  }, 60);
+  _fakeSimDiscoverPathsAsync(
+    function onProgress(found, stackSize) {
+      var statusEl = document.getElementById('fsl-status');
+      if (statusEl) statusEl.textContent = found + ' caminho(s) encontrado(s)… (fila: ' + stackSize + ')';
+    },
+    function onDone(paths) {
+      _fakeSimPaths = paths;
+      _fakeSimRenderFilterBar();
+      _fakeSimRenderPathList();
+    }
+  );
 }
 
 function fakeSimClose() {
@@ -68,267 +74,276 @@ function fakeSimOverlayClick(e) {
   if (e.target === document.getElementById('fake-sim-overlay')) fakeSimClose();
 }
 
-// ── DFS — descobre caminhos e coleta metadados ────────────────────
-function _fakeSimDiscoverPaths() {
-  var paths     = [];
+// ── DFS iterativo assíncrono — processa em chunks para não travar a UI ───
+// onProgress(found, stackSize) : chamado a cada chunk
+// onDone(paths)                : chamado quando termina
+function _fakeSimDiscoverPathsAsync(onProgress, onDone) {
   var MAX_PATHS = 150;
   var MAX_DEPTH = 500;
-  // Usa root finder local que ignora sim-visited (não depende do estado do simulador real)
+  var CHUNK     = 250; // frames por tick do event loop
+
   var _fsSrcs = cy.nodes().filter(function(n) { return n.incomers('node').length === 0; });
   var root = _fsSrcs.length > 0 ? _fsSrcs[0].id() : (cy.nodes()[0] ? cy.nodes()[0].id() : null);
-  if (!root) return paths;
 
-  function dfs(nodeId, visitedLoops, branches, nodeSeq, depth, meta) {
-    if (paths.length >= MAX_PATHS) return;
-    if (depth > MAX_DEPTH) {
-      // Caminho cortado por profundidade máxima — finaliza o que foi coletado até aqui
-      var mTrunc = _fsCloneMeta(meta);
-      mTrunc.truncated = true;
-      _fakeSimFinalizePath(nodeSeq, branches, mTrunc, paths);
-      return;
-    }
-    if (!nodeId) return;
-    var node = cy.getElementById(nodeId);
-    if (!node || node.length === 0) return;
+  var paths = [];
+  if (!root) { onDone(paths); return; }
 
-    var tipo   = node.data('tipo') || '';
-    var label  = (node.data('label') || '').replace(/\r?\n/g, ' ');
-    var labelU = label.toUpperCase();
-    nodeSeq = nodeSeq.concat([nodeId]);
-
-    // ── Clona metadados e coleta por tipo de nó ──────────────────
-    var m = _fsCloneMeta(meta);
-
-    // ── SEARCH — rastreia tabelas internas pesquisadas ────────────
-    if (tipo === 'search') {
-      var _srchTblFs = (node.data('searchTable') || '').trim();
-      if (_srchTblFs && !m.tableSearches.includes(_srchTblFs)) m.tableSearches.push(_srchTblFs);
-    }
-
-    // ── SORT — rastreia arquivo SD (sort work file) ──────────────
-    if (tipo === 'sort' || tipo === 'sort-input' || tipo === 'sort-engine' || tipo === 'sort-output') {
-      var _sfNode = (node.data('sortFile') || '').trim();
-      if (_sfNode && !m.sortFiles.includes(_sfNode)) m.sortFiles.push(_sfNode);
-    }
-    // RELEASE: alimenta arquivo SD
-    if (tipo === 'write' && /^RELEASE\b/.test(labelU)) {
-      var _sfRel = labelU.match(/RELEASE\s+([A-Z][A-Z0-9-]*)/);
-      if (_sfRel) {
-        var _sfRelFd = _sfRel[1];
-        if (!m.sortFiles.includes(_sfRelFd)) m.sortFiles.push(_sfRelFd);
-        if (!m.writtenFiles.includes(_sfRelFd)) m.writtenFiles.push(_sfRelFd);
-      }
-    }
-    // RETURN: lê do arquivo SD (análogo ao READ para arquivos FD)
-    if (tipo === 'io' && /^RETURN\s+([A-Z][A-Z0-9-]*)/.test(labelU)) {
-      var _sfRetM = labelU.match(/^RETURN\s+([A-Z][A-Z0-9-]*)/);
-      if (_sfRetM) {
-        var _sfRetFd = _sfRetM[1];
-        if (!m.sortFiles.includes(_sfRetFd)) m.sortFiles.push(_sfRetFd);
-        if (!m.readFiles.includes(_sfRetFd)) m.readFiles.push(_sfRetFd);
-      }
-    }
-
-    if (tipo === 'open') {
-      // Extrai TODOS os pares modo+arquivo da instrução OPEN      // Ex.: OPEN INPUT ARQ-A OUTPUT ARQ-B EXTEND ARQ-C
-      var modeKw = /\b(INPUT|OUTPUT|I-O|EXTEND)\b/g;
-      var openRest = labelU.replace(/^OPEN\s*/,'');
-      var curMode = 'INPUT'; // fallback
-      var openToks = openRest.split(/[\s,]+/).filter(Boolean);
-      openToks.forEach(function(tok) {
-        if (/^(INPUT|OUTPUT|I-O|EXTEND)$/.test(tok)) { curMode = tok; return; }
-        var fdN = tok.replace(/[^A-Z0-9-]/g,'');
-        if (!fdN) return;
-        if (!m.openedFiles.includes(fdN)) m.openedFiles.push(fdN);
-        // Registra o modo: se já existe, mantém o mais permissivo
-        // Prioridade: I-O > EXTEND > INPUT > OUTPUT
-        var prev = m.fileOpenModes[fdN];
-        var prio = { 'I-O':4, 'EXTEND':3, 'INPUT':2, 'OUTPUT':1 };
-        if (!prev || (prio[curMode]||0) > (prio[prev]||0)) {
-          m.fileOpenModes[fdN] = curMode;
-        }
-      });
-    }
-    if (tipo === 'io' || tipo === 'read' || /^READ\b/.test(labelU)) {
-      var fdR = labelU.match(/READ\s+([A-Z][A-Z0-9-]*)/);
-      if (fdR && !m.readFiles.includes(fdR[1])) m.readFiles.push(fdR[1]);
-    }
-    if (tipo === 'write' || /^(?:WRITE|REWRITE)\b/.test(labelU)) {
-      var fdW = labelU.match(/(?:WRITE|REWRITE)\s+([A-Z][A-Z0-9-]*)/);
-      if (fdW && !m.writtenFiles.includes(fdW[1])) m.writtenFiles.push(fdW[1]);
-    }
-    if (tipo === 'sql') {
-      var sqlV = (node.data('detail') || label).replace(/\s+/g, ' ').trim().substring(0, 70);
-      if (!m.sqlOps.length || m.sqlOps[m.sqlOps.length - 1] !== sqlV) m.sqlOps.push(sqlV);
-    }
-    if (tipo === 'call') {
-      var callM = labelU.match(/CALL\s+['"]?([A-Z0-9][A-Z0-9-]*)['"]?/);
-      if (callM && !m.callPrograms.includes(callM[1])) m.callPrograms.push(callM[1]);
-    }
-    // Rastreia MOVE e SET para resolver valores de host vars no WHERE
-    if (/^MOVE\s/.test(labelU)) {
-      var mvM = labelU.replace(/\.$/, '').match(/^MOVE\s+(.+?)\s+TO\s+(.+)$/);
-      if (mvM) {
-        var mvSrc = mvM[1].trim();
-        mvM[2].trim().split(/\s+/).forEach(function(dest) {
-          dest = dest.replace(/\.$/, '');
-          if (/^[A-Z][A-Z0-9-]*$/.test(dest)) m.varMoves.push({ src: mvSrc, dest: dest });
-        });
-      }
-    }
-    if (/^SET\s/.test(labelU)) {
-      var setM = labelU.replace(/\.$/, '').match(/^SET\s+(.+?)\s+TO\s+(TRUE|FALSE)$/);
-      if (setM) {
-        setM[1].trim().split(/\s+/).forEach(function(name88) {
-          m.varMoves.push({ src: '__88__' + setM[2], dest: name88 });
-        });
-      }
-    }
-    // Encerramento anormal: ABEND, ABENDAR, CEE3ABD, ROTINA-ERRO, FIM-ABEND, ENCERRA-ERRO, etc.
-    if (/\bABEND(?:AR)?\b|\bCEE3ABD\b|\bABNORMAL\b|\bROTINA-(?:ERRO|ABEND)\b|\bFIM-(?:ABEND|ERRO)\b|\bENCERRA-(?:ERRO|ABEND)\b|\bFINALIZAR-(?:ERRO|ABEND)\b/.test(labelU)) {
-      m.abend = true;
-      // Encerra o caminho imediatamente — não continua após ABEND
-      m.stopNodeId = nodeId;
-      m.stopLabel  = labelU;
-      _fakeSimFinalizePath(nodeSeq, branches, m, paths);
-      return;
-    }
-
-    // ── Fim do caminho ────────────────────────────────────────────
-    if (tipo === 'stop' || tipo === 'goback') {
-      m.stopNodeId = nodeId; // regista qual nó STOP/GOBACK encerrou este caminho
-      m.stopLabel  = labelU;
-      _fakeSimFinalizePath(nodeSeq, branches, m, paths);
-      return;
-    }
-
-    var nexts = _simNextNodes(nodeId);
-    if (nexts.length === 0) {
-      m.stopNodeId = nodeId; // fim de grafo sem nó stop explícito
-      m.stopLabel  = labelU;
-      _fakeSimFinalizePath(nodeSeq, branches, m, paths);
-      return;
-    }
-
-    // ── LOOP ──────────────────────────────────────────────────────
-    if (tipo === 'loop') {
-      var loopBody = null, loopExit = null;
-      node.outgoers('edge').forEach(function (e) {
-        var lbl = (e.data('label') || '').toUpperCase();
-        if      (lbl === 'LOOP') loopBody = e.target();
-        else if (lbl === 'FIM')  {
-          loopExit = e.target();
-          if (loopExit && loopExit.data('tipo') === 'merge') {
-            var mn = _simNextNodes(loopExit.id());
-            if (mn.length > 0) loopExit = mn[0];
-          }
-        }
-      });
-      if (!loopBody && nexts.length > 0) loopBody = nexts[0];
-      if (!loopExit && nexts.length > 1) loopExit = nexts[1];
-      var newVL = new Set(visitedLoops);
-      newVL.add(nodeId);
-
-      if (loopBody && !visitedLoops.has(nodeId)) {
-        var mL = _fsCloneMeta(m);
-        mL.enteredLoop = true;
-        mL.narrative.push('Entra no loop: ' + label.substring(0, 50));
-        dfs(loopBody.id(), newVL, branches, nodeSeq, depth + 1, mL);
-      }
-      if (loopExit) {
-        var mNL = _fsCloneMeta(m);
-        mNL.narrative.push('Sai do loop imediatamente: ' + label.substring(0, 40));
-        dfs(loopExit.id(), newVL, branches, nodeSeq, depth + 1, mNL);
-      }
-      return;
-    }
-
-    // ── IF / EVALUATE ─────────────────────────────────────────────
-    if ((tipo === 'if' || tipo === 'evaluate') && nexts.length > 1) {
-      nexts.forEach(function (next) {
-        if (paths.length >= MAX_PATHS) return;
-        var edgeLbl  = _simEdgeLabel(nodeId, next.id());
-        var edgeLblU = edgeLbl.toUpperCase().trim();
-
-        var branch = {
-          nodeId    : nodeId,
-          condition : label,
-          tipo      : tipo,
-          chosenEdge: next.id(),
-          edgeLabel : edgeLbl
-        };
-
-        var mB = _fsCloneMeta(m);
-
-        if (edgeLblU === 'EOF' || edgeLblU === 'AT END' || edgeLblU === 'FIM DE ARQUIVO') {
-          mB.hitEof = true;
-          mB.narrative.push('Chega ao fim do arquivo (AT END): ' + label.substring(0, 45));
-        } else if (edgeLblU === 'INVÁLIDA' || edgeLblU === 'INVALIDA' || edgeLblU === 'INVALID KEY') {
-          mB.hitFileError = true;
-          mB.narrative.push('Chave inválida no arquivo: ' + label.substring(0, 45));
-        } else {
-          // Detecta status de arquivo
-          // '00' = OK | '10' = EOF sem dados esperado | outro = erro real
-          var condU = label.toUpperCase();
-          if (/\bST[-_]?\b|\bSTATUS\b|\b[A-Z][A-Z0-9-]*-ST\b/.test(condU)
-              && (edgeLblU === 'SIM' || edgeLblU === 'TRUE')) {
-            if (/[=\s]['"]?10['"]?\b/.test(condU)) {
-              mB.hitEof = true;          // status '10' = fim de arquivo esperado
-            } else if (!/=[=\s]*['"]?00['"]?/.test(condU)) {
-              mB.hitFileError = true;    // status diferente de '00' e '10' = erro real
-            }
-          }
-          // Detecta SQLCODE
-          // 0 = OK | 100 = NOT FOUND (sem dados esperado) | outro = erro real
-          if (/SQLCODE|SQLERR|SQLSTATE/.test(condU)
-              && (edgeLblU === 'SIM' || edgeLblU === 'TRUE')) {
-            if (/[=\s]100\b/.test(condU)) {
-              mB.hitSqlNotFound = true;  // SQLCODE=100 = sem registro esperado
-            } else if (!/=\s*0\b/.test(condU)) {
-              mB.hitSqlError = true;     // SQLCODE diferente de 0 e 100 = erro real
-            }
-          }
-          // Detecta condição de classe (IS NOT NUMERIC, NOT ALPHABETIC, NOT ZEROS, etc.)
-          // SIM nesses casos = dado inválido → retorno antecipado por validação
-          if ((edgeLblU === 'SIM' || edgeLblU === 'TRUE' || edgeLblU === 'VERDADEIRO') &&
-              /\b(?:IS\s+)?NOT\s+(?:NUMERIC|ALPHABETIC(?:-LOWER|-UPPER)?|ALPHA|ZEROS?|ZEROES?|SPACES?)/.test(condU)) {
-            mB.hasClassFailure = true;
-          }
-          mB.narrative.push(
-            (tipo === 'if' ? 'IF ' : 'EVALUATE ') + label.substring(0, 50) + ' → ' + (edgeLbl || '?')
-          );
-        }
-
-        var nextTarget = next;
-        if (nextTarget.data('tipo') === 'merge') {
-          var mns = _simNextNodes(next.id());
-          if (mns.length > 0) nextTarget = mns[0]; else return;
-        }
-        dfs(nextTarget.id(), visitedLoops, branches.concat([branch]), nodeSeq, depth + 1, mB);
-      });
-      return;
-    }
-
-    // ── Nó único ──────────────────────────────────────────────────
-    dfs(nexts[0].id(), visitedLoops, branches, nodeSeq, depth + 1, m);
-  }
-
-  dfs(root, new Set(), [], [], 0, {
+  var _initMeta = {
     categories: [], openedFiles: [], readFiles: [], writtenFiles: [],
     sqlOps: [], callPrograms: [], narrative: [],
     fileOpenModes: {},
-    varMoves: [],        // [ { src, dest } ] — MOVEs e SETs executados ao longo do caminho
-    sortFiles: [],       // arquivos SD envolvidos em SORT interno
-    tableSearches: [],   // tabelas internas pesquisadas via SEARCH/SEARCH ALL
+    varMoves: [], sortFiles: [], tableSearches: [],
     stopNodeId: null, stopLabel: '',
-    abend: false, truncated: false, enteredLoop: false, hitEof: false, hitFileError: false,
+    abend: false, truncated: false, enteredLoop: false,
+    hitEof: false, hitFileError: false,
     hitSqlError: false, hitSqlNotFound: false,
     hasClassFailure: false
-  });
+  };
 
-  // ── Pós-processamento: marca saídas antecipadas ────────────────────────
-  // Identifica se há mais de um nó de parada. Se sim, o "stop principal"
-  // é o que aparece no maior número de caminhos com processamento real.
+  // Pilha explícita: cada entrada é um "frame" da chamada recursiva original
+  var stack = [{ nodeId: root, visitedLoops: new Set(), branches: [], nodeSeq: [], depth: 0, meta: _initMeta }];
+
+  function tick() {
+    var count = 0;
+    while (stack.length > 0 && paths.length < MAX_PATHS && count < CHUNK) {
+      count++;
+      var fr = stack.pop();
+      var nodeId = fr.nodeId, visitedLoops = fr.visitedLoops;
+      var branches = fr.branches, nodeSeq = fr.nodeSeq;
+      var depth = fr.depth, meta = fr.meta;
+
+      if (depth > MAX_DEPTH) {
+        var mTrunc = _fsCloneMeta(meta);
+        mTrunc.truncated = true;
+        _fakeSimFinalizePath(nodeSeq, branches, mTrunc, paths);
+        continue;
+      }
+      if (!nodeId) continue;
+      var node = cy.getElementById(nodeId);
+      if (!node || node.length === 0) continue;
+
+      var tipo   = node.data('tipo') || '';
+      var label  = (node.data('label') || '').replace(/\r?\n/g, ' ');
+      var labelU = label.toUpperCase();
+      nodeSeq = nodeSeq.concat([nodeId]);
+
+      var m = _fsCloneMeta(meta);
+
+      // ── SEARCH — rastreia tabelas internas pesquisadas ────────────
+      if (tipo === 'search') {
+        var _srchTblFs = (node.data('searchTable') || '').trim();
+        if (_srchTblFs && !m.tableSearches.includes(_srchTblFs)) m.tableSearches.push(_srchTblFs);
+      }
+
+      // ── SORT — rastreia arquivo SD (sort work file) ──────────────
+      if (tipo === 'sort' || tipo === 'sort-input' || tipo === 'sort-engine' || tipo === 'sort-output') {
+        var _sfNode = (node.data('sortFile') || '').trim();
+        if (_sfNode && !m.sortFiles.includes(_sfNode)) m.sortFiles.push(_sfNode);
+      }
+      // RELEASE: alimenta arquivo SD
+      if (tipo === 'write' && /^RELEASE\b/.test(labelU)) {
+        var _sfRel = labelU.match(/RELEASE\s+([A-Z][A-Z0-9-]*)/);
+        if (_sfRel) {
+          var _sfRelFd = _sfRel[1];
+          if (!m.sortFiles.includes(_sfRelFd)) m.sortFiles.push(_sfRelFd);
+          if (!m.writtenFiles.includes(_sfRelFd)) m.writtenFiles.push(_sfRelFd);
+        }
+      }
+      // RETURN: lê do arquivo SD (análogo ao READ para arquivos FD)
+      if (tipo === 'io' && /^RETURN\s+([A-Z][A-Z0-9-]*)/.test(labelU)) {
+        var _sfRetM = labelU.match(/^RETURN\s+([A-Z][A-Z0-9-]*)/);
+        if (_sfRetM) {
+          var _sfRetFd = _sfRetM[1];
+          if (!m.sortFiles.includes(_sfRetFd)) m.sortFiles.push(_sfRetFd);
+          if (!m.readFiles.includes(_sfRetFd)) m.readFiles.push(_sfRetFd);
+        }
+      }
+
+      if (tipo === 'open') {
+        // Extrai TODOS os pares modo+arquivo da instrução OPEN
+        var openRest = labelU.replace(/^OPEN\s*/,'');
+        var curMode = 'INPUT'; // fallback
+        var openToks = openRest.split(/[\s,]+/).filter(Boolean);
+        openToks.forEach(function(tok) {
+          if (/^(INPUT|OUTPUT|I-O|EXTEND)$/.test(tok)) { curMode = tok; return; }
+          var fdN = tok.replace(/[^A-Z0-9-]/g,'');
+          if (!fdN) return;
+          if (!m.openedFiles.includes(fdN)) m.openedFiles.push(fdN);
+          var prev = m.fileOpenModes[fdN];
+          var prio = { 'I-O':4, 'EXTEND':3, 'INPUT':2, 'OUTPUT':1 };
+          if (!prev || (prio[curMode]||0) > (prio[prev]||0)) {
+            m.fileOpenModes[fdN] = curMode;
+          }
+        });
+      }
+      if (tipo === 'io' || tipo === 'read' || /^READ\b/.test(labelU)) {
+        var fdR = labelU.match(/READ\s+([A-Z][A-Z0-9-]*)/);
+        if (fdR && !m.readFiles.includes(fdR[1])) m.readFiles.push(fdR[1]);
+      }
+      if (tipo === 'write' || /^(?:WRITE|REWRITE)\b/.test(labelU)) {
+        var fdW = labelU.match(/(?:WRITE|REWRITE)\s+([A-Z][A-Z0-9-]*)/);
+        if (fdW && !m.writtenFiles.includes(fdW[1])) m.writtenFiles.push(fdW[1]);
+      }
+      if (tipo === 'sql') {
+        var sqlV = (node.data('detail') || label).replace(/\s+/g, ' ').trim().substring(0, 70);
+        if (!m.sqlOps.length || m.sqlOps[m.sqlOps.length - 1] !== sqlV) m.sqlOps.push(sqlV);
+      }
+      if (tipo === 'call') {
+        var callM = labelU.match(/CALL\s+['"]?([A-Z0-9][A-Z0-9-]*)['"]?/);
+        if (callM && !m.callPrograms.includes(callM[1])) m.callPrograms.push(callM[1]);
+      }
+      // Rastreia MOVE e SET para resolver valores de host vars no WHERE
+      if (/^MOVE\s/.test(labelU)) {
+        var mvM = labelU.replace(/\.$/, '').match(/^MOVE\s+(.+?)\s+TO\s+(.+)$/);
+        if (mvM) {
+          var mvSrc = mvM[1].trim();
+          mvM[2].trim().split(/\s+/).forEach(function(dest) {
+            dest = dest.replace(/\.$/, '');
+            if (/^[A-Z][A-Z0-9-]*$/.test(dest)) m.varMoves.push({ src: mvSrc, dest: dest });
+          });
+        }
+      }
+      if (/^SET\s/.test(labelU)) {
+        var setM = labelU.replace(/\.$/, '').match(/^SET\s+(.+?)\s+TO\s+(TRUE|FALSE)$/);
+        if (setM) {
+          setM[1].trim().split(/\s+/).forEach(function(name88) {
+            m.varMoves.push({ src: '__88__' + setM[2], dest: name88 });
+          });
+        }
+      }
+      // Encerramento anormal
+      if (/\bABEND(?:AR)?\b|\bCEE3ABD\b|\bABNORMAL\b|\bROTINA-(?:ERRO|ABEND)\b|\bFIM-(?:ABEND|ERRO)\b|\bENCERRA-(?:ERRO|ABEND)\b|\bFINALIZAR-(?:ERRO|ABEND)\b/.test(labelU)) {
+        m.abend = true;
+        m.stopNodeId = nodeId;
+        m.stopLabel  = labelU;
+        _fakeSimFinalizePath(nodeSeq, branches, m, paths);
+        continue;
+      }
+
+      // ── Fim do caminho ────────────────────────────────────────────
+      if (tipo === 'stop' || tipo === 'goback') {
+        m.stopNodeId = nodeId;
+        m.stopLabel  = labelU;
+        _fakeSimFinalizePath(nodeSeq, branches, m, paths);
+        continue;
+      }
+
+      var nexts = _simNextNodes(nodeId);
+      if (nexts.length === 0) {
+        m.stopNodeId = nodeId;
+        m.stopLabel  = labelU;
+        _fakeSimFinalizePath(nodeSeq, branches, m, paths);
+        continue;
+      }
+
+      // ── LOOP ──────────────────────────────────────────────────────
+      if (tipo === 'loop') {
+        var loopBody = null, loopExit = null;
+        node.outgoers('edge').forEach(function (e) {
+          var lbl = (e.data('label') || '').toUpperCase();
+          if      (lbl === 'LOOP') loopBody = e.target();
+          else if (lbl === 'FIM')  {
+            loopExit = e.target();
+            if (loopExit && loopExit.data('tipo') === 'merge') {
+              var mn = _simNextNodes(loopExit.id());
+              if (mn.length > 0) loopExit = mn[0];
+            }
+          }
+        });
+        if (!loopBody && nexts.length > 0) loopBody = nexts[0];
+        if (!loopExit && nexts.length > 1) loopExit = nexts[1];
+        var newVL = new Set(visitedLoops);
+        newVL.add(nodeId);
+        // Empurra loopExit antes para que loopBody seja processado primeiro (LIFO)
+        if (loopExit) {
+          var mNL = _fsCloneMeta(m);
+          mNL.narrative.push('Sai do loop imediatamente: ' + label.substring(0, 40));
+          stack.push({ nodeId: loopExit.id(), visitedLoops: newVL, branches: branches, nodeSeq: nodeSeq, depth: depth + 1, meta: mNL });
+        }
+        if (loopBody && !visitedLoops.has(nodeId)) {
+          var mL = _fsCloneMeta(m);
+          mL.enteredLoop = true;
+          mL.narrative.push('Entra no loop: ' + label.substring(0, 50));
+          stack.push({ nodeId: loopBody.id(), visitedLoops: newVL, branches: branches, nodeSeq: nodeSeq, depth: depth + 1, meta: mL });
+        }
+        continue;
+      }
+
+      // ── IF / EVALUATE ─────────────────────────────────────────────
+      if ((tipo === 'if' || tipo === 'evaluate') && nexts.length > 1) {
+        nexts.forEach(function (next) {
+          if (paths.length >= MAX_PATHS) return;
+          var edgeLbl  = _simEdgeLabel(nodeId, next.id());
+          var edgeLblU = edgeLbl.toUpperCase().trim();
+          var branch = {
+            nodeId    : nodeId,
+            condition : label,
+            tipo      : tipo,
+            chosenEdge: next.id(),
+            edgeLabel : edgeLbl
+          };
+          var mB = _fsCloneMeta(m);
+          if (edgeLblU === 'EOF' || edgeLblU === 'AT END' || edgeLblU === 'FIM DE ARQUIVO') {
+            mB.hitEof = true;
+            mB.narrative.push('Chega ao fim do arquivo (AT END): ' + label.substring(0, 45));
+          } else if (edgeLblU === 'INVÁLIDA' || edgeLblU === 'INVALIDA' || edgeLblU === 'INVALID KEY') {
+            mB.hitFileError = true;
+            mB.narrative.push('Chave inválida no arquivo: ' + label.substring(0, 45));
+          } else {
+            var condU = label.toUpperCase();
+            if (/\bST[-_]?\b|\bSTATUS\b|\b[A-Z][A-Z0-9-]*-ST\b/.test(condU)
+                && (edgeLblU === 'SIM' || edgeLblU === 'TRUE')) {
+              if (/[=\s]['"]?10['"]?\b/.test(condU)) {
+                mB.hitEof = true;
+              } else if (!/=[=\s]*['"]?00['"]?/.test(condU)) {
+                mB.hitFileError = true;
+              }
+            }
+            if (/SQLCODE|SQLERR|SQLSTATE/.test(condU)
+                && (edgeLblU === 'SIM' || edgeLblU === 'TRUE')) {
+              if (/[=\s]100\b/.test(condU)) {
+                mB.hitSqlNotFound = true;
+              } else if (!/=\s*0\b/.test(condU)) {
+                mB.hitSqlError = true;
+              }
+            }
+            if ((edgeLblU === 'SIM' || edgeLblU === 'TRUE' || edgeLblU === 'VERDADEIRO') &&
+                /\b(?:IS\s+)?NOT\s+(?:NUMERIC|ALPHABETIC(?:-LOWER|-UPPER)?|ALPHA|ZEROS?|ZEROES?|SPACES?)/.test(condU)) {
+              mB.hasClassFailure = true;
+            }
+            mB.narrative.push(
+              (tipo === 'if' ? 'IF ' : 'EVALUATE ') + label.substring(0, 50) + ' → ' + (edgeLbl || '?')
+            );
+          }
+          var nextTarget = next;
+          if (nextTarget.data('tipo') === 'merge') {
+            var mns = _simNextNodes(next.id());
+            if (mns.length > 0) nextTarget = mns[0]; else return;
+          }
+          stack.push({ nodeId: nextTarget.id(), visitedLoops: visitedLoops, branches: branches.concat([branch]), nodeSeq: nodeSeq, depth: depth + 1, meta: mB });
+        });
+        continue;
+      }
+
+      // ── Nó único ──────────────────────────────────────────────────
+      stack.push({ nodeId: nexts[0].id(), visitedLoops: visitedLoops, branches: branches, nodeSeq: nodeSeq, depth: depth + 1, meta: m });
+    }
+
+    onProgress(paths.length, stack.length);
+
+    if (stack.length > 0 && paths.length < MAX_PATHS) {
+      setTimeout(tick, 0); // cede o event loop e continua no próximo tick
+    } else {
+      _fakeSimPostProcess(paths);
+      onDone(paths);
+    }
+  }
+
+  setTimeout(tick, 0);
+}
+
+// ── Pós-processamento extraído: marca saídas antecipadas ──────────
+function _fakeSimPostProcess(paths) {
   var stopCounts = {};
   paths.forEach(function(p) {
     var sid = p.meta.stopNodeId;
@@ -336,7 +351,6 @@ function _fakeSimDiscoverPaths() {
   });
   var stopIds = Object.keys(stopCounts);
   if (stopIds.length > 1) {
-    // Pontua cada stop: prioridade a caminhos com processamento real
     var primaryStop = null;
     var maxScore = -1;
     stopIds.forEach(function(sid) {
@@ -348,24 +362,18 @@ function _fakeSimDiscoverPaths() {
       if (score > maxScore) { maxScore = score; primaryStop = sid; }
     });
     if (!primaryStop) {
-      // Sem processamento em nenhum: usa o mais frequente
       primaryStop = stopIds.sort(function(a,b){ return stopCounts[b]-stopCounts[a]; })[0];
     }
-    // Marca todos os caminhos que não terminam no stop principal
     paths.forEach(function(p) {
       if (p.meta.stopNodeId && p.meta.stopNodeId !== primaryStop && !p.meta.abend) {
         if (p.categories.indexOf('saida-antecipada') < 0) {
           p.categories.push('saida-antecipada');
         }
-        // Remove 'normal' e 'straight' pois a saída antecipada não é sucesso
         p.categories = p.categories.filter(function(c){ return c !== 'normal' && c !== 'straight'; });
-        // Se ficou vazio após remover normal/straight, garante 'saida-antecipada'
         if (p.categories.length === 0) p.categories.push('saida-antecipada');
       }
     });
   }
-
-  return paths;
 }
 
 function _fsCloneMeta(m) {
