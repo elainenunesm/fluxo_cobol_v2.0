@@ -320,25 +320,31 @@ function bkParseCopybook(src) {
   for (const raw of rawLines) {
     let codeStr;
 
-    if (raw.length >= 7 && raw[0] >= '0' && raw[0] <= '9') {
-      // ── Formato fixo (linha começa com área de sequência numérica) ──
-      const ind = raw[6]; // col 7 = indicador
-      if (ind === '*' || ind === '/' || ind === 'D' || ind === 'd') continue; // comentário / debug
-      if (ind === '-') {
-        // Indicador de continuação: cola SEM espaço à linha anterior
-        // (normalmente para literais ou identificadores cortados na col 72)
-        const cont = raw.substring(7, 72).replace(/^\s+/, '');
-        if (cont && joined.length) joined[joined.length - 1] += cont;
-        continue;
+    // ── Padrão COBOL fixed-format: col 7 (índice 6) é SEMPRE o indicador ──
+    // Aplica para qualquer linha com >= 7 chars, independente do conteúdo
+    // dos 6 primeiros bytes (dígitos, espaços ou letras como "COPY01", "REC001").
+    if (raw.length >= 7) {
+      const ind  = raw[6];
+      const seq6 = raw.substring(0, 6);
+      // Área de sequência: dígitos, espaços ou rótulo alfanumérico sem espaços (ex: COPY01)
+      const hasSeqArea = /^[\d ]+$/.test(seq6) || /^[A-Za-z0-9]{1,6}$/.test(seq6);
+      if (hasSeqArea) {
+        if (ind === '*' || ind === '/') continue; // comentário / eject
+        if (ind === 'D' || ind === 'd') continue; // debug line (ignorada)
+        if (ind === '-') {
+          // Indicador de continuação: cola SEM espaço à linha anterior
+          const cont = raw.substring(7, 72).replace(/^\s+/, '');
+          if (cont && joined.length) joined[joined.length - 1] += cont;
+          continue;
+        }
+        // Extrai apenas código (cols 8-72 = índices 7-71)
+        codeStr = raw.substring(7, 72);
+      } else {
+        // ── Formato livre: linha não tem área de sequência standard ──
+        codeStr = raw.substring(0, 72);
       }
-      // Extrai apenas a área de código (cols 8-72 = índices 7-71)
-      // Ignora área de identificação (cols 73-80) que ferramentas de edição
-      // costumam colocar após a col 72 (nome do programa, nº de sequência etc.)
-      codeStr = raw.substring(7, 72);
     } else {
-      // ── Formato livre / indentado sem número de sequência ──
-      // Também trunca em 72 para eliminar possível área de identificação
-      // aposta por ferramentas que adicionam sequence numbers no final da linha.
+      // Linha curta demais para ter área de sequência
       codeStr = raw.substring(0, 72);
     }
 
