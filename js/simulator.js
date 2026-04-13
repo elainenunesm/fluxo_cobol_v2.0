@@ -296,8 +296,7 @@ function _simInitVars(code) {
   _simVarDefs.forEach(function(v) {
     if (v.is88) {
       _sim88Defs[v.name] = { parent: v.parentName, values: v.values };
-    } else if (!v.isGroup) {
-      _simVars[v.name] = v.value;
+    } else if (!v.isGroup) {      _simVars[v.name] = v.value;
       _simVarsInitial[v.name] = v.value;
       // OCCURS: inicializa células individuais VAR(1)..VAR(N) para rastreamento.
       // Para tabelas grandes (> 500 células) pré-inicializamos apenas as primeiras 500;
@@ -336,6 +335,17 @@ function _simInitVars(code) {
     _simDb2Tables  = {};
     _simDb2Cursors = {};
   }
+}
+
+// Mescla condMap88 (de parseCobol) em _sim88Defs — complement para COPY/inline não parseados
+function _simMergeCond88(condMap88) {
+  if (!condMap88) return;
+  Object.keys(condMap88).forEach(function(cname) {
+    if (!_sim88Defs.hasOwnProperty(cname)) {
+      var def = condMap88[cname];
+      _sim88Defs[cname] = { parent: def.parentName, values: def.values };
+    }
+  });
 }
 
 // ── Arquivos de entrada simulados ──────────────────────────────
@@ -999,95 +1009,158 @@ function _simFileSetField(inp) {
 
 // ── Painel DB2 ─────────────────────────────────────────────────
 
+// ── Helpers para extração robusta de blocos EXEC SQL e nomes SQL ──────────────
+
+// Extrai blocos EXEC SQL...END-EXEC linha a linha (suporta programas grandes sem
+// problemas de regex catastrófico em strings de centenas de KB)
+function _extractExecSqlBlocks(code) {
+  if (!code) return [];
+  var blocks = [];
+  var inExec = false;
+  var buf = [];
+  var lines = code.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i];
+    if (l.length >= 7 && /^[\d ]{6}/.test(l)) {
+      if (l[6] === '-') l = l.slice(7);
+      else l = l.slice(6);
+    }
+    var t = l.trim();
+    if (!t || t[0] === '*' || t.indexOf('*>') === 0) continue;
+    var up = t.toUpperCase();
+    if (!inExec) {
+      var execIdx = up.indexOf('EXEC SQL');
+      if (execIdx < 0) continue;
+      var after = t.slice(execIdx + 8).trim();
+      var endIdx = after.toUpperCase().indexOf('END-EXEC');
+      if (endIdx >= 0) {
+        var body = after.slice(0, endIdx).replace(/\s+/g, ' ').trim().toUpperCase();
+        if (body) blocks.push(body);
+        continue;
+      }
+      inExec = true;
+      buf = after ? [after] : [];
+    } else {
+      var endIdx2 = up.indexOf('END-EXEC');
+      if (endIdx2 >= 0) {
+        var beforeEnd = t.slice(0, endIdx2).trim();
+        if (beforeEnd) buf.push(beforeEnd);
+        inExec = false;
+        var body2 = buf.join(' ').replace(/\s+/g, ' ').trim().toUpperCase();
+        if (body2) blocks.push(body2);
+        buf = [];
+      } else {
+        if (t) buf.push(t);
+      }
+    }
+  }
+  return blocks;
+}
+
+// Limpa nome de coluna SQL: remove qualificador de tabela (T.COL→COL),
+// alias com AS (COL AS ALIAS→COL) e prefixo de host-var (:COL→COL)
+function _cleanSqlCol(raw) {
+  var c = raw.trim().replace(/^:/, '');
+  if (c.indexOf('.') >= 0) c = c.split('.').pop().trim();
+  c = c.replace(/\s+AS\s+\S+\s*$/i, '').trim();
+  return /^[A-Z][A-Z0-9_#@$-]*$/i.test(c) ? c.toUpperCase() : '';
+}
+
+// Extrai nome real de tabela do fragmento após FROM (suporta SCHEMA.TABLE e alias)
+function _extractFromTbl(fromFrag) {
+  var m = /^([A-Z][A-Z0-9_#@$.]*)/i.exec((fromFrag || '').trim());
+  if (!m) return '';
+  var parts = m[1].toUpperCase().split('.');
+  return parts[parts.length - 1];
+}
+
 // Extrai tabelas usadas em EXEC SQL e detecta colunas via SELECT ... INTO ... FROM
 function _parseDb2Tables(code) {
   var tables = {};
   if (!code) return tables;
-  // Normaliza linhas (remove colunas de sequência, continuações e comentários)
-  var normalized = code.split('\n').map(function(l) {
-    if (l.length >= 7 && /^[\d ]{6}/.test(l)) {
-      if (l[6] === '-') l = l.slice(7); // linha de continuação COBOL
-      else l = l.slice(6);
-    }
-    var t = l.trim();
-    if (!t || t[0] === '*' || t.startsWith('*>')) return '';
-    return t;
-  }).join(' ');
-  // Extrai blocos EXEC SQL ... END-EXEC
-  var execRe = /EXEC\s+SQL\s+([\s\S]+?)\s+END-EXEC/gi;
-  var m;
-  while ((m = execRe.exec(normalized)) !== null) {
-    var sql = m[1].replace(/\s+/g, ' ').trim().toUpperCase();
-    // SELECT ... INTO ... FROM table
-    var selM = sql.match(/^SELECT\s+([\s\S]+?)\s+INTO\s+([\s\S]+?)\s+FROM\s+([A-Z][A-Z0-9_#@]*)(?:\s+WHERE\s+([\s\S]*))?$/i);
+  var blocks = _extractExecSqlBlocks(code);
+  blocks.forEach(function(sql) {
+    // SELECT ... INTO ... FROM table [alias] [WHERE ...]
+    var selM = sql.match(/^SELECT\s+([\s\S]+?)\s+INTO\s+([\s\S]+?)\s+FROM\s+([A-Z][A-Z0-9_#@$.]+)/i);
     if (selM) {
-      var cols     = selM[1].replace(/\s+/g,'').split(',').map(function(c){ return c.trim().replace(/^:/,''); }).filter(Boolean);
-      var intoVars = selM[2].replace(/\s+/g,'').split(',').map(function(v){ return v.trim().replace(/^:/,''); }).filter(Boolean);
-      var tbl = selM[3];
-      if (!tables[tbl]) tables[tbl] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
-      cols.forEach(function(c){ if (tables[tbl].columns.indexOf(c) < 0) tables[tbl].columns.push(c); });
-      tables[tbl].selectMaps.push({ cols: cols, into: intoVars });
+      var tbl = _extractFromTbl(selM[3]);
+      if (tbl) {
+        var rawCols = selM[1].trim();
+        var cols = rawCols === '*' ? [] :
+          rawCols.split(',').map(_cleanSqlCol).filter(Boolean);
+        var intoVars = selM[2].split(',').map(function(v){ return v.trim().replace(/^:/,''); }).filter(Boolean);
+        if (!tables[tbl]) tables[tbl] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
+        cols.forEach(function(c){ if (tables[tbl].columns.indexOf(c) < 0) tables[tbl].columns.push(c); });
+        tables[tbl].selectMaps.push({ cols: cols, into: intoVars });
+        // WHERE — extrai mapeamento col→hostVar
+        var whereM = sql.match(/\bWHERE\s+([\s\S]+?)(?:\s+(?:ORDER|FETCH|FOR|WITH|GROUP|HAVING)\b|$)/i);
+        var whereMap = {};
+        if (whereM) {
+          whereM[1].split(/\s+AND\s+/i).forEach(function(wc) {
+            var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@$.]*)\s*=\s*:([A-Z][A-Z0-9-]*)/i);
+            if (wm) {
+              var cn = _cleanSqlCol(wm[1]) || wm[1].split('.').pop().toUpperCase();
+              var hv = wm[2];
+              if (cn && tables[tbl].columns.indexOf(cn) < 0) tables[tbl].columns.push(cn);
+              whereMap[cn] = hv;
+            } else {
+              var wm2 = wc.trim().match(/^([A-Z][A-Z0-9_#@$.]*)\s*=/i);
+              if (wm2) {
+                var cn2 = _cleanSqlCol(wm2[1]) || wm2[1].split('.').pop().toUpperCase();
+                if (cn2 && tables[tbl].columns.indexOf(cn2) < 0) tables[tbl].columns.push(cn2);
+              }
+            }
+          });
+        }
+        if (Object.keys(whereMap).length) tables[tbl].whereMaps.push(whereMap);
+      }
     }
     // INSERT INTO table (cols) VALUES (...)
-    var insM = sql.match(/^INSERT\s+INTO\s+([A-Z][A-Z0-9_#@]*)\s*(?:\(([^)]+)\))?/i);
+    var insM = sql.match(/^INSERT\s+INTO\s+([A-Z][A-Z0-9_#@$.]*)\s*(?:\(([^)]+)\))?/i);
     if (insM) {
-      var tbl2 = insM[1];
-      if (!tables[tbl2]) tables[tbl2] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
-      if (insM[2]) {
-        insM[2].split(',').forEach(function(c){
-          var cn = c.trim().replace(/^:/,'');
-          if (tables[tbl2].columns.indexOf(cn) < 0) tables[tbl2].columns.push(cn);
+      var tbl2 = _extractFromTbl(insM[1]);
+      if (tbl2) {
+        if (!tables[tbl2]) tables[tbl2] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
+        if (insM[2]) {
+          insM[2].split(',').forEach(function(c){
+            var cn = _cleanSqlCol(c);
+            if (cn && tables[tbl2].columns.indexOf(cn) < 0) tables[tbl2].columns.push(cn);
+          });
+        }
+      }
+    }
+    // UPDATE table SET col=:v [WHERE ...]
+    var updM = sql.match(/^UPDATE\s+([A-Z][A-Z0-9_#@$.]*)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]*))?$/i);
+    if (updM) {
+      var tblUpd = _extractFromTbl(updM[1]);
+      if (tblUpd) {
+        if (!tables[tblUpd]) tables[tblUpd] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
+        (updM[2] || '').split(',').forEach(function(sa) {
+          var cm = sa.trim().match(/^([A-Z][A-Z0-9_#@$.]*)\s*=/i);
+          if (cm) { var cn = _cleanSqlCol(cm[1]); if (cn && tables[tblUpd].columns.indexOf(cn) < 0) tables[tblUpd].columns.push(cn); }
+        });
+        (updM[3] || '').split(/\s+AND\s+/i).forEach(function(wc) {
+          var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@$.]*)\s*=/i);
+          if (wm) { var cn = _cleanSqlCol(wm[1]); if (cn && tables[tblUpd].columns.indexOf(cn) < 0) tables[tblUpd].columns.push(cn); }
+        });
+      }
+    } else {
+      var updFb = sql.match(/^UPDATE\s+([A-Z][A-Z0-9_#@$.]*)/i);
+      if (updFb) { var tblFb = _extractFromTbl(updFb[1]); if (tblFb && !tables[tblFb]) tables[tblFb] = { columns: [], rows: [], selectMaps: [], whereMaps: [] }; }
+    }
+    // DELETE FROM table [WHERE ...]
+    var delM = sql.match(/^DELETE\s+(?:FROM\s+)?([A-Z][A-Z0-9_#@$.]*)\s*(?:WHERE\s+([\s\S]*))?$/i);
+    if (delM) {
+      var tblDel = _extractFromTbl(delM[1]);
+      if (tblDel) {
+        if (!tables[tblDel]) tables[tblDel] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
+        (delM[2] || '').split(/\s+AND\s+/i).forEach(function(wc) {
+          var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@$.]*)\s*=/i);
+          if (wm) { var cn = _cleanSqlCol(wm[1]); if (cn && tables[tblDel].columns.indexOf(cn) < 0) tables[tblDel].columns.push(cn); }
         });
       }
     }
-    // UPDATE table SET col=:v WHERE col=:v — extrai colunas do SET e do WHERE
-    var updM = sql.match(/^UPDATE\s+([A-Z][A-Z0-9_#@]*)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]*))?$/i);
-    if (updM) {
-      var tblUpd = updM[1];
-      if (!tables[tblUpd]) tables[tblUpd] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
-      // Colunas do SET: "NOME = :WS-NOME, SALDO = :WS-SALDO"
-      (updM[2] || '').split(',').forEach(function(sa) {
-        var cm = sa.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=/i);
-        if (cm) { var cn = cm[1].trim(); if (tables[tblUpd].columns.indexOf(cn) < 0) tables[tblUpd].columns.push(cn); }
-      });
-      // Colunas do WHERE: "ID = :WS-ID AND ..."
-      (updM[3] || '').split(/\s+AND\s+/i).forEach(function(wc) {
-        var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=/i);
-        if (wm) { var cn = wm[1].trim(); if (tables[tblUpd].columns.indexOf(cn) < 0) tables[tblUpd].columns.push(cn); }
-      });
-    } else {
-      // Fallback: só detecta a tabela sem colunas (UPDATE sem SET visível no label)
-      var updFb = sql.match(/^UPDATE\s+([A-Z][A-Z0-9_#@]*)/i);
-      if (updFb && !tables[updFb[1]]) tables[updFb[1]] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
-    }
-    // DELETE FROM table WHERE col=:v — extrai colunas do WHERE
-    var delM = sql.match(/^DELETE\s+FROM\s+([A-Z][A-Z0-9_#@]*)(?:\s+WHERE\s+([\s\S]*))?$/i);
-    if (delM) {
-      var tblDel = delM[1];
-      if (!tables[tblDel]) tables[tblDel] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
-      (delM[2] || '').split(/\s+AND\s+/i).forEach(function(wc) {
-        var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=/i);
-        if (wm) { var cn = wm[1].trim(); if (tables[tblDel].columns.indexOf(cn) < 0) tables[tblDel].columns.push(cn); }
-      });
-    }
-    // SELECT WHERE — extrai colunas do WHERE e mapa col→hostVar
-    if (selM) {
-      var tblSel = selM[3];
-      var whereMap = {};
-      (selM[4] || '').split(/\s+AND\s+/i).forEach(function(wc) {
-        var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=\s*:([A-Z][A-Z0-9-]*)/i);
-        if (wm) {
-          var cn = wm[1].trim(), hv = wm[2].trim();
-          if (tables[tblSel] && tables[tblSel].columns.indexOf(cn) < 0) tables[tblSel].columns.push(cn);
-          whereMap[cn] = hv;
-        } else {
-          var wm2 = wc.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=/i);
-          if (wm2) { var cn2 = wm2[1].trim(); if (tables[tblSel] && tables[tblSel].columns.indexOf(cn2) < 0) tables[tblSel].columns.push(cn2); }
-        }
-      });
-      if (tables[tblSel] && Object.keys(whereMap).length) tables[tblSel].whereMaps.push(whereMap);
-    }
-  }
+  });
   return tables;
 }
 
@@ -1095,38 +1168,31 @@ function _parseDb2Tables(code) {
 function _parseDb2Cursors(code, tables) {
   var cursors = {};
   if (!code) return cursors;
-  var normalized = code.split('\n').map(function(l) {
-    if (l.length >= 7 && /^[\d ]{6}/.test(l)) {
-      if (l[6] === '-') l = l.slice(7);
-      else l = l.slice(6);
-    }
-    var t = l.trim();
-    if (!t || t[0] === '*' || t.startsWith('*>')) return '';
-    return t;
-  }).join(' ');
-  var execRe = /EXEC\s+SQL\s+([\s\S]+?)\s+END-EXEC/gi;
-  var m;
-  while ((m = execRe.exec(normalized)) !== null) {
-    var sql = m[1].replace(/\s+/g, ' ').trim().toUpperCase();
-    // DECLARE cursor CURSOR [WITH HOLD] FOR SELECT cols FROM table [WHERE ...] [ORDER BY ...]
-    var declM = sql.match(/^DECLARE\s+([A-Z][A-Z0-9_]*)\s+CURSOR\s+(?:[\s\S]+?\s+)?FOR\s+SELECT\s+([\s\S]+?)\s+FROM\s+([A-Z][A-Z0-9_#@]*)(?:\s+WHERE\s+([\s\S]+?))?(?:\s+ORDER\s+BY\s+[\s\S]*)?$/i);
+  var blocks = _extractExecSqlBlocks(code);
+  blocks.forEach(function(sql) {
+    // DECLARE cursor CURSOR [WITH HOLD|WITH RETURN|SCROLL] FOR SELECT cols FROM table [alias] [WHERE...][ORDER BY...]
+    var declM = sql.match(/^DECLARE\s+([A-Z][A-Z0-9_$#@-]*)\s+CURSOR\s+(?:[\s\S]+?\s+)?FOR\s+SELECT\s+([\s\S]+?)\s+FROM\s+([A-Z][A-Z0-9_#@$.]+)/i);
     if (declM) {
       var cursorName = declM[1];
       var rawCols    = declM[2].trim();
-      var tblName    = declM[3];
+      var tblName    = _extractFromTbl(declM[3]);
       var cols = rawCols === '*' ? [] :
-        rawCols.replace(/\s+/g,'').split(',').map(function(c){ return c.trim().replace(/^:/,''); }).filter(Boolean);
-      if (!tables[tblName]) tables[tblName] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
-      cols.forEach(function(c){ if (tables[tblName].columns.indexOf(c) < 0) tables[tblName].columns.push(c); });
-      // WHERE cols também
-      (declM[4] || '').split(/\s+AND\s+/i).forEach(function(wc) {
-        var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@]*)\s*=/i);
-        if (wm) { var cn = wm[1].trim(); if (tables[tblName].columns.indexOf(cn) < 0) tables[tblName].columns.push(cn); }
-      });
-      cursors[cursorName] = { tableName: tblName, cols: cols, pointer: 0, isOpen: false, intoVars: [] };
+        rawCols.split(',').map(_cleanSqlCol).filter(Boolean);
+      if (tblName) {
+        if (!tables[tblName]) tables[tblName] = { columns: [], rows: [], selectMaps: [], whereMaps: [] };
+        cols.forEach(function(c){ if (tables[tblName].columns.indexOf(c) < 0) tables[tblName].columns.push(c); });
+        var whereM = sql.match(/\bWHERE\s+([\s\S]+?)(?:\s+(?:ORDER|FETCH|FOR|WITH|GROUP|HAVING)\b|$)/i);
+        if (whereM) {
+          (whereM[1] || '').split(/\s+AND\s+/i).forEach(function(wc) {
+            var wm = wc.trim().match(/^([A-Z][A-Z0-9_#@$.]*)\s*=/i);
+            if (wm) { var cn = _cleanSqlCol(wm[1]); if (cn && tables[tblName].columns.indexOf(cn) < 0) tables[tblName].columns.push(cn); }
+          });
+        }
+      }
+      cursors[cursorName] = { tableName: tblName || '', cols: cols, pointer: 0, isOpen: false, intoVars: [] };
     }
-    // FETCH cursor INTO :v1, :v2 — guarda intoVars no cursor para uso no runtime
-    var fetchM = sql.match(/^FETCH\s+([A-Z][A-Z0-9_]*)\s+INTO\s+([\s\S]+)$/i);
+    // FETCH [NEXT FROM] cursor INTO :v1, :v2 — guarda intoVars no cursor para uso no runtime
+    var fetchM = sql.match(/^FETCH\s+(?:NEXT\s+FROM\s+)?([A-Z][A-Z0-9_$#@-]*)\s+INTO\s+([\s\S]+)$/i);
     if (fetchM) {
       var fcName = fetchM[1];
       var intoV  = fetchM[2].split(',').map(function(v){ return v.trim().replace(/^:/,''); }).filter(Boolean);
@@ -1134,7 +1200,7 @@ function _parseDb2Cursors(code, tables) {
       // fallback: cria entrada rasa se ainda não existe
       else cursors[fcName] = { tableName: '', cols: [], pointer: 0, isOpen: false, intoVars: intoV };
     }
-  }
+  });
   return cursors;
 }
 
@@ -2283,13 +2349,11 @@ function _simExecuteSql(sqlLabel) {
   // ── DECLARE CURSOR → registra em _simDb2Cursors (parse + runtime) ──
   if (/^DECLARE\b/i.test(sqlRaw)) {
     // Garante registro mesmo que _parseDb2Cursors não tenha encontrado no fonte
-    var _declM = sqlRaw.match(/^DECLARE\s+([A-Z][A-Z0-9_#@]*)\s+CURSOR\s+FOR\s+SELECT\s+([\s\S]+?)\s+FROM\s+([A-Z][A-Z0-9_#@]*)/i);
+    var _declM = sqlRaw.match(/^DECLARE\s+([A-Z][A-Z0-9_#@]*)\s+CURSOR\s+FOR\s+SELECT\s+([\s\S]+?)\s+FROM\s+([A-Z][A-Z0-9_#@$.]+)/i);
     if (_declM) {
       var _declCurName = _declM[1].trim();
-      var _declCols    = _declM[2].split(',').map(function(c){
-        return c.trim().replace(/^[A-Z][A-Z0-9_#@]*\.\s*/i,'').trim();
-      });
-      var _declTblName = _declM[3].trim();
+      var _declCols    = _declM[2].split(',').map(_cleanSqlCol).filter(Boolean);
+      var _declTblName = _extractFromTbl(_declM[3]);
       if (!_simDb2Cursors[_declCurName]) {
         // intoVars pode ter sido pré-populado pelo parser FETCH
         var _existInto = (_simDb2Cursors[_declCurName] || {}).intoVars || [];
@@ -2410,12 +2474,13 @@ function _simExecuteSql(sqlLabel) {
   }
 
   // ── SELECT ─────────────────────────────────────────────────────
-  var selM = sqlRaw.match(/^SELECT\s+([\s\S]+?)\s+INTO\s+([\s\S]+?)\s+FROM\s+([A-Z][A-Z0-9_#@]*)(?:\s+WHERE\s+([\s\S]*))?$/i);
+  var selM = sqlRaw.match(/^SELECT\s+([\s\S]+?)\s+INTO\s+([\s\S]+?)\s+FROM\s+([A-Z][A-Z0-9_#@$.]+)/i);
   if (selM) {
-    var cols     = selM[1].replace(/\s+/g,'').split(',').map(function(c){ return c.trim().replace(/^:/,''); }).filter(Boolean);
-    var intoVars = selM[2].replace(/\s+/g,'').split(',').map(function(v){ return v.trim().replace(/^:/,''); }).filter(Boolean);
-    var tblName  = selM[3];
-    var where    = (selM[4] || '').trim();
+    var cols     = selM[1].split(',').map(_cleanSqlCol).filter(Boolean);
+    var intoVars = selM[2].split(',').map(function(v){ return v.trim().replace(/^:/,''); }).filter(Boolean);
+    var tblName  = _extractFromTbl(selM[3]);
+    var _selWM   = sqlRaw.match(/\bWHERE\s+([\s\S]+?)(?:\s+(?:ORDER\s+BY|FETCH\s+FIRST|GROUP\s+BY|FOR\s+UPDATE|WITH\s+UR|OPTIMIZE)\b|$)/i);
+    var where    = _selWM ? _selWM[1].trim() : '';
     var tbl = _simDb2Tables[tblName];
     if (!tbl || tbl.rows.length === 0) {
       _simSetVarInternal('SQLCODE', '+100');
@@ -2531,9 +2596,9 @@ function _simExecuteSql(sqlLabel) {
   }
 
   // ── UPDATE ─────────────────────────────────────────────────────
-  var updM = sqlRaw.match(/^UPDATE\s+([A-Z][A-Z0-9_#@]*)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]*))?$/i);
+  var updM = sqlRaw.match(/^UPDATE\s+([A-Z][A-Z0-9_#@$.]*)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]*))?$/i);
   if (updM) {
-    var tblName3 = updM[1];
+    var tblName3 = _extractFromTbl(updM[1]);
     var tbl3 = _simDb2Tables[tblName3];
     if (!tbl3) { _simSetVarInternal('SQLCODE', '-204'); _simLog('\u23cb SQL UPDATE: tabela ' + tblName3 + ' não cadastrada (SQLCODE=-204)', 'sim-log-error'); _simRefreshVarsPanel(); return; }
     var setPart  = updM[2];
@@ -2598,9 +2663,9 @@ function _simExecuteSql(sqlLabel) {
   }
 
   // ── DELETE ─────────────────────────────────────────────────────
-  var delM = sqlRaw.match(/^DELETE\s+FROM\s+([A-Z][A-Z0-9_#@]*)(?:\s+WHERE\s+([\s\S]*))?$/i);
+  var delM = sqlRaw.match(/^DELETE\s+(?:FROM\s+)?([A-Z][A-Z0-9_#@$.]*)(?:\s+WHERE\s+([\s\S]*))?$/i);
   if (delM) {
-    var tblName4 = delM[1];
+    var tblName4 = _extractFromTbl(delM[1]);
     var tbl4 = _simDb2Tables[tblName4];
     if (!tbl4) { _simSetVarInternal('SQLCODE', '-204'); _simLog('\u23cb SQL DELETE: tabela ' + tblName4 + ' não cadastrada (SQLCODE=-204)', 'sim-log-error'); _simRefreshVarsPanel(); return; }
     var whereDel = (delM[2] || '').trim();
@@ -2753,6 +2818,11 @@ function simOpen() {
   // Inicializa variáveis WORKING-STORAGE do código atual
   var code = (document.getElementById('input') || {}).value || '';
   _simInitVars(code);
+  // Mescla level-88 extraído pelo parseCobol (cobre COPY/inline não parseados)
+  if (typeof parseCobol === 'function') {
+    var _pc88 = parseCobol(code);
+    if (_pc88 && _pc88.condMap88) _simMergeCond88(_pc88.condMap88);
+  }
   _sim.on = true;
   document.body.classList.add('sim-active');
   document.getElementById('sim-panel').classList.add('sim-visible');

@@ -762,6 +762,10 @@
   #bk-table td { padding: 4px 10px; border-bottom: 1px solid #eef0f8; white-space: nowrap; vertical-align: middle; }
   #bk-table tr:hover td { background: #eef3ff; }
   #bk-table tr.bk-row-group td { background: #f0edff; font-weight: 700; }
+  /* Nível 88 — condition-name: amarelo âmbar */
+  #bk-table tr.bk-row-88 td { background: #fffbea; font-style: italic; }
+  #bk-table tr.bk-row-88:hover td { background: #fff3c0; }
+  .bk-88-badge { font-size: 11px; font-weight: 600; color: #b45309; background: #fef3c7; border: 1px solid #fcd34d; border-radius: 3px; padding: 1px 6px; }
   /* REDEFINES de layout (nível 01): laranja — variante de registro */
   #bk-table tr.bk-row-redef-layout td { background: #fff8f0; }
   #bk-table tr.bk-row-redef-layout:hover td { background: #ffeedd; }
@@ -805,6 +809,9 @@
   .bk-tree-line:hover { background: #eef3ff; }
   .bk-tree-lvl  { color: #bbb; font-size: 10px; min-width: 20px; text-align: right; flex-shrink: 0; }
   .bk-tree-name { font-weight: 700; color: #1a237e; }
+  .bk-tree-lvl88  { color: #b45309 !important; }
+  .bk-tree-name88 { color: #b45309 !important; }
+  .bk-tree-88-vals { color: #b45309; font-size: 10px; font-style: italic; }
   .bk-tree-pic  { color: #555; }
   .bk-tree-pos  { color: #bbb; font-size: 10px; }
   .bk-tree-redef { color: #e65100; font-style: italic; font-size: 10px; }
@@ -4583,8 +4590,11 @@
   body.dark-mode #bk-table td { border-bottom-color: #252840; color: #c5cae9; }
   body.dark-mode #bk-table tr:hover td { background: #1f2856; }
   body.dark-mode #bk-table tr.bk-row-group td { background: #1e1f3a; color: #b39ddb; }
-  body.dark-mode #bk-table tr.bk-row-redef-layout td { background: #2e1f0f; }
-  body.dark-mode #bk-table tr.bk-row-redef-layout:hover td { background: #3d2a14; }
+  body.dark-mode #bk-table tr.bk-row-88 td { background: #2a2000; }
+  body.dark-mode #bk-table tr.bk-row-88:hover td { background: #3a2e00; }
+  body.dark-mode .bk-88-badge { color: #fcd34d; background: #2a2000; border-color: #78600a; }
+  body.dark-mode .bk-tree-lvl88, body.dark-mode .bk-tree-name88, body.dark-mode .bk-tree-88-vals { color: #fcd34d !important; }
+  body.dark-mode #bk-table tr.bk-row-redef-layout td { background: #2e1f0f; }  body.dark-mode #bk-table tr.bk-row-redef-layout:hover td { background: #3d2a14; }
   body.dark-mode .bk-redef-layout { color: #ffab40; background: #2e1f0f; border-color: #6d3a00; }
   body.dark-mode #bk-table tr.bk-row-redef-internal td { background: #0d2420; }
   body.dark-mode #bk-table tr.bk-row-redef-internal:hover td { background: #12302a; }

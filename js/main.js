@@ -1192,14 +1192,16 @@ function parseCobol(code) {
   const lines = code.split("\n");
   let estrutura = {};          // nome -> linhas[]
   let tipos = {};              // nome -> 'section' | 'paragrafo'
-  let secoes = {};             // sectionNome -> [par�grafoNome, ...]
-  let ordemParagrafos = [];    // todos em ordem de apari��o
+  let secoes = {};             // sectionNome -> [parágrafoNome, ...]
+  let ordemParagrafos = [];    // todos em ordem de aparição
   let atual = null;
   let secaoAtual = null;
   let programId = null;
-  let lineNumMap = {};         // nome -> �ndices globais de linha (0-based)
+  let lineNumMap = {};         // nome -> índices globais de linha (0-based)
   let fdMap = {};              // nome-registro-01 → nome-arquivo (FD)
   let _lastFD = null;          // último FD encontrado (para capturar o 01 seguinte)
+  let condMap88 = {};          // condition-name-88 → { parentName, values[] }
+  let _lastNon88Lvl = null;    // último nome de campo não-88 (para vincular level 88)
 
   // Sections de outras divis�es (DATA, ENV) � ignoradas no fluxo
   const sectionsNaoProcedure = new Set([
@@ -1271,17 +1273,38 @@ function parseCobol(code) {
       return;
     }
 
-    // Antes do PROCEDURE DIVISION ignora tudo (exceto FD e 01 do FILE SECTION)
+    // Antes do PROCEDURE DIVISION ignora tudo (exceto FD, 01 do FILE SECTION e level 88)
     if (!inProcedure) {
       // Detecta FD/SD para construir fdMap (registro-01 → nome-arquivo)
       // SD = Sort Description; também mapeado para que RELEASE/RETURN resolvam corretamente
       const fdM = l.match(/^[SF]D\s+([A-Z][A-Z0-9-]*)/i);
-      if (fdM) { _lastFD = fdM[1].toUpperCase(); }
-      else if (_lastFD) {
+      if (fdM) { _lastFD = fdM[1].toUpperCase(); _lastNon88Lvl = null; return; }
+      if (_lastFD) {
         const recM = l.match(/^01\s+([A-Z][A-Z0-9-]*)/i);
         if (recM) { fdMap[recM[1].toUpperCase()] = _lastFD; _lastFD = null; }
         else if (/^\d/.test(l.trim())) { /* outra linha de nível — ignora */ }
         else { _lastFD = null; }
+      }
+      // Extrai level 88 condition-names de toda a DATA DIVISION
+      const m88 = l.match(/^88\s+([A-Z@#$][A-Z0-9@#$-]*)\s+VALUES?\s+(.+?)\.?\s*$/i);
+      if (m88 && _lastNon88Lvl) {
+        const cname88 = m88[1].toUpperCase();
+        const raw88v  = m88[2];
+        const vals88  = [];
+        const vRe88   = /'([^']*)'|"([^"]*)"|([^\s,]+)/g;
+        let vm88;
+        while ((vm88 = vRe88.exec(raw88v)) !== null) {
+          const tok = vm88[1] !== undefined ? vm88[1] : (vm88[2] !== undefined ? vm88[2] : vm88[3]);
+          if (tok && !/^(THRU|THROUGH|,|\.)$/i.test(tok)) vals88.push(tok.toUpperCase());
+        }
+        if (vals88.length) condMap88[cname88] = { parentName: _lastNon88Lvl, values: vals88 };
+      } else {
+        // Atualiza referência para campos não-88 (qualquer nível com nome)
+        const lvlFieldM = l.match(/^\d{1,2}\s+([A-Z@#$][A-Z0-9@#$-]*)/i);
+        if (lvlFieldM) {
+          const lvNum = parseInt(l, 10);
+          if (lvNum !== 88 && lvNum !== 66) _lastNon88Lvl = lvlFieldM[1].toUpperCase();
+        }
       }
       return;
     }
@@ -1347,7 +1370,7 @@ function parseCobol(code) {
     if (!temConteudo) tipos[nome] = 'fim-paragrafo';
   });
 
-  return { estrutura, tipos, secoes, ordemParagrafos, programId, lineNumMap, fdMap };
+  return { estrutura, tipos, secoes, ordemParagrafos, programId, lineNumMap, fdMap, condMap88 };
 }
 
 // ================= AST BUILDER =================

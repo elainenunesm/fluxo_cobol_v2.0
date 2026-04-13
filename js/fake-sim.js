@@ -7,6 +7,7 @@
 var _FS_CATEGORIES = {
   normal       : { label: 'Fim Normal',       icon: '✔',  color: '#22c55e' },
   abend        : { label: 'Abend / Erro',     icon: '💥', color: '#ef4444' },
+  truncado     : { label: 'Profundidade Máx.',icon: '⚠️', color: '#94a3b8' },
   'file-read'  : { label: 'Leitura Arquivo',  icon: '📂', color: '#3b82f6' },
   'file-write' : { label: 'Gravação Arquivo', icon: '📝', color: '#8b5cf6' },
   'file-eof'   : { label: 'Fim de Arquivo',   icon: '📭', color: '#f59e0b' },
@@ -38,6 +39,10 @@ function fakeSimOpen() {
   }
   var code = (document.getElementById('input') || {}).value || '';
   _simInitVars(code);
+  if (typeof parseCobol === 'function') {
+    var _fsPc88 = parseCobol(code);
+    if (_fsPc88 && _fsPc88.condMap88) _simMergeCond88(_fsPc88.condMap88);
+  }
 
   document.getElementById('fake-sim-overlay').classList.add('open');
   document.getElementById('fake-sim-paths-list').innerHTML =
@@ -66,13 +71,22 @@ function fakeSimOverlayClick(e) {
 // ── DFS — descobre caminhos e coleta metadados ────────────────────
 function _fakeSimDiscoverPaths() {
   var paths     = [];
-  var MAX_PATHS = 80;
-  var MAX_DEPTH = 250;
-  var root = _simFindRoot();
+  var MAX_PATHS = 150;
+  var MAX_DEPTH = 500;
+  // Usa root finder local que ignora sim-visited (não depende do estado do simulador real)
+  var _fsSrcs = cy.nodes().filter(function(n) { return n.incomers('node').length === 0; });
+  var root = _fsSrcs.length > 0 ? _fsSrcs[0].id() : (cy.nodes()[0] ? cy.nodes()[0].id() : null);
   if (!root) return paths;
 
   function dfs(nodeId, visitedLoops, branches, nodeSeq, depth, meta) {
-    if (depth > MAX_DEPTH || paths.length >= MAX_PATHS) return;
+    if (paths.length >= MAX_PATHS) return;
+    if (depth > MAX_DEPTH) {
+      // Caminho cortado por profundidade máxima — finaliza o que foi coletado até aqui
+      var mTrunc = _fsCloneMeta(meta);
+      mTrunc.truncated = true;
+      _fakeSimFinalizePath(nodeSeq, branches, mTrunc, paths);
+      return;
+    }
     if (!nodeId) return;
     var node = cy.getElementById(nodeId);
     if (!node || node.length === 0) return;
@@ -307,7 +321,7 @@ function _fakeSimDiscoverPaths() {
     sortFiles: [],       // arquivos SD envolvidos em SORT interno
     tableSearches: [],   // tabelas internas pesquisadas via SEARCH/SEARCH ALL
     stopNodeId: null, stopLabel: '',
-    abend: false, enteredLoop: false, hitEof: false, hitFileError: false,
+    abend: false, truncated: false, enteredLoop: false, hitEof: false, hitFileError: false,
     hitSqlError: false, hitSqlNotFound: false,
     hasClassFailure: false
   });
@@ -372,6 +386,7 @@ function _fsCloneMeta(m) {
     stopNodeId     : m.stopNodeId,
     stopLabel      : m.stopLabel,
     abend          : m.abend,
+    truncated      : m.truncated || false,
     enteredLoop    : m.enteredLoop,
     hitEof         : m.hitEof,
     hitFileError   : m.hitFileError,
@@ -384,6 +399,7 @@ function _fsCloneMeta(m) {
 function _fakeSimFinalizePath(nodeSeq, branches, meta, paths) {
   var cats = [];
   if (meta.abend)              cats.push('abend');
+  if (meta.truncated)          cats.push('truncado');
   if (meta.hitEof)             cats.push('file-eof');
   if (meta.hitFileError)       cats.push('file-error');
   if (meta.hitSqlError)        cats.push('sql-error');
@@ -534,6 +550,12 @@ function _fakeSimGenerateVarsForPath(path) {
             else if (/^(<|LESS)/i.test(op) && !isNaN(rhsNum))       vars[varN] = _fsNumStr(rhsNum,     vdef);
             else vars[varN] = rhs;
           }
+        } else {
+          // Variável não encontrada em _simVarDefs (p.ex.: de COPY não expandido)
+          // Assign mínimo para que apareça no painel de variáveis
+          if (wantTrue) vars[varN] = rhs;
+          else if (/^(=|EQUAL)/i.test(op) && !opNot) vars[varN] = (rhs === '' ? 'N' : (rhs === 'N' ? 'S' : 'N'));
+          else vars[varN] = rhs;
         }
         return;
       }
@@ -546,12 +568,31 @@ function _fakeSimGenerateVarsForPath(path) {
           vars[vSolo[1]] = wantTrue
             ? (vdSolo.picType === '9' ? '1' : 'S')
             : (vdSolo.picType === '9' ? '0' : ' ');
+        } else {
+          // Variável não encontrada (COPY) — valor sintético
+          vars[vSolo[1]] = wantTrue ? 'S' : 'N';
         }
       }
 
     } else if (b.tipo === 'evaluate') {
       var evalSubj = (b.condition || '').replace(/^EVALUATE\s+/i, '').trim().toUpperCase();
-      if (evalSubj && evalSubj !== 'TRUE') {
+      if (evalSubj === 'TRUE' || !evalSubj) {
+        // EVALUATE TRUE WHEN <level88-name> — resolve pai e seta valor
+        var when88Raw = (b.edgeLabel || '').trim().toUpperCase();
+        if (when88Raw && when88Raw !== 'OTHER' && when88Raw !== 'OUTRO') {
+          var negated88 = /^NOT\s+/.test(when88Raw);
+          var when88Name = negated88 ? when88Raw.replace(/^NOT\s+/, '') : when88Raw;
+          var def88ev = _simVarDefs.find(function (d) { return d.is88 && d.name === when88Name; });
+          if (def88ev && def88ev.parentName) {
+            if (!negated88) {
+              vars[def88ev.parentName] = def88ev.values[0] || 'S';
+            } else {
+              var parentDef88 = _simVarDefs.find(function (d) { return d.name === def88ev.parentName && !d.isGroup; });
+              vars[def88ev.parentName] = _fsOtherValue88(def88ev.values, parentDef88);
+            }
+          }
+        }
+      } else if (evalSubj) {
         var vdefEv = _simVarDefs.find(function (d) { return d.name === evalSubj && !d.isGroup; });
         if (vdefEv && b.edgeLabel && edgeLblU !== 'OTHER' && edgeLblU !== 'OUTRO') {
           var whenVal = (b.edgeLabel || '').trim().replace(/^['"]|['"]$/g, '');
@@ -631,7 +672,9 @@ function _fakeSimBuildStory(path) {
 
   var isParadaErro = cats.indexOf('parada-erro') >= 0;
 
-  if (m.abend) {
+  if (m.truncated) {
+    p.push('⚠️ <b>Caminho incompleto</b> — o programa é grande demais para exploração completa. As operações abaixo foram encontradas até o ponto de corte.');
+  } else if (m.abend) {
     p.push('💥 Termina em <b>ABEND — encerramento anormal explícito</b> (ABEND/ABENDAR/CEE3ABD ou rotina de abort chamada pelo programa).');
   } else if (isParadaErro && isEarlyExit) {
     var errTipo = m.hitFileError ? 'status de arquivo ≠ \'00\'' : 'SQLCODE ≠ 0';
@@ -820,6 +863,14 @@ function _fakeSimRenderDetail(path) {
     }
   });
 
+  // Inclui variáveis de COPY não expandido: estão em keyNames e em vars mas não em _simVarDefs
+  var _simVarNames = new Set(_simVarDefs.map(function(v){ return v.name; }));
+  keyNames.forEach(function(kn) {
+    if (!_simVarNames.has(kn) && vars.hasOwnProperty(kn) && !rows.some(function(r){ return r.name === kn; })) {
+      rows.push({ name: kn, val: vars[kn], defVal: '?', pic: '?', section: '(COPY)', isKey: true, changed: false });
+    }
+  });
+
   var cobolCode = rows
     .filter(function (r) { return r.isKey || r.changed; })
     .map(function (r) {
@@ -988,7 +1039,13 @@ function _fakeSimGenFileRecords(fdName, howMany) {
 // Gera N linhas fictícias para uma tabela DB2
 function _fakeSimGenDb2Rows(tableName, howMany) {
   var tbl = _simDb2Tables[tableName];
-  if (!tbl || !tbl.columns.length) return [];
+  if (!tbl) return [];
+  // Fallback: se colunas não foram identificadas (ex: SELECT *),
+  // usa as variáveis do INTO da primeira selectMap como nomes de coluna
+  if (!tbl.columns.length && tbl.selectMaps && tbl.selectMaps.length && tbl.selectMaps[0].into.length) {
+    tbl.columns = tbl.selectMaps[0].into.slice();
+  }
+  if (!tbl.columns.length) return [];
   var rows = [];
   for (var i = 0; i < howMany; i++) {
     var row = {};
@@ -1089,7 +1146,11 @@ function _fakeSimInjectData(path) {
   // ── Tabelas DB2 ───────────────────────────────────────────────
   Object.keys(_simDb2Tables).forEach(function(tblName) {
     var tbl = _simDb2Tables[tblName];
-    if (!tbl || !tbl.columns.length) return;
+    if (!tbl) return;
+    // Pula só se não há colunas E não há fallback via selectMaps.into
+    var hasCols = tbl.columns.length > 0 ||
+      (tbl.selectMaps && tbl.selectMaps.length && tbl.selectMaps[0].into.length > 0);
+    if (!hasCols) return;
     if (tbl.rows && tbl.rows.length > 0) return;
     var isUsed = path.meta.sqlOps.some(function(op){ return op.toUpperCase().indexOf(tblName) >= 0; });
     if (!isUsed && path.meta.sqlOps.length === 0) isUsed = true;
@@ -1250,8 +1311,10 @@ function _fakeSimRenderDataPreview(path) {
 
   // ── Tabelas DB2 ───────────────────────────────────────────────
   if (path.meta.sqlOps.length) {
+    // Inclui tabelas com colunas conhecidas + tabelas referenciadas no path mas sem colunas
     var db2Names = Object.keys(_simDb2Tables).filter(function(t){
-      return _simDb2Tables[t].columns.length > 0;
+      if (_simDb2Tables[t].columns.length > 0) return true;
+      return path.meta.sqlOps.some(function(op){ return op.toUpperCase().indexOf(t) >= 0; });
     });
     if (db2Names.length) {
       out += '<div class="fs-data-section">';
@@ -1265,7 +1328,9 @@ function _fakeSimRenderDataPreview(path) {
         var tbl = _simDb2Tables[tblName];
         var rows = tbl.rows && tbl.rows.length ? tbl.rows : (path.meta.hitSqlError ? [] : _fakeSimGenDb2Rows(tblName, 2));
         out += '<div class="fs-data-fd-name">' + _fsEsc(tblName) + ' <span class="fs-data-qty">' + rows.length + ' linha(s)</span></div>';
-        if (rows.length) {
+        if (!tbl.columns.length) {
+          out += '<div class="fs-data-empty">⚠ Colunas não identificadas — use <b>SELECT COL1, COL2</b> (não SELECT *) ou importe o DDL.</div>';
+        } else if (rows.length) {
           out += '<div class="fs-data-table-wrap"><table class="fs-data-table">';
           out += '<thead><tr>' + tbl.columns.map(function(c){ return '<th>' + _fsEsc(c) + '</th>'; }).join('') + '</tr></thead>';
           out += '<tbody>';
@@ -1647,6 +1712,10 @@ function fakeSimRunAll() {
   // Reinicializa variáveis do programa do zero (parseando o código novamente)
   var code = (document.getElementById('input') || {}).value || '';
   _simInitVars(code);
+  if (typeof parseCobol === 'function') {
+    var _fsBatchPc88 = parseCobol(code);
+    if (_fsBatchPc88 && _fsBatchPc88.condMap88) _simMergeCond88(_fsBatchPc88.condMap88);
+  }
 
   // Salva snapshot limpo das vars e das tabelas DB2 (ANTES de qualquer injeção)
   // para que cada caminho comece a partir do mesmo estado inicial

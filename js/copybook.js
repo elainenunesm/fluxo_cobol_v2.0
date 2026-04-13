@@ -221,7 +221,11 @@ function bkDrop(e) {
 function bkLoadFile(file, forceNew) {
   const reader = new FileReader();
   reader.onload = ev => {
-    const src  = ev.target.result || '';
+    // Limita cada linha à coluna 72 (cols 73-80 = área de identificação COBOL — versão, seq, etc.)
+    const rawText = ev.target.result || '';
+    const src = rawText.split(/\r\n|\r|\n/)
+      .map(l => l.length > 72 ? l.substring(0, 72) : l)
+      .join('\n');
     const m01  = src.match(/\b01\s+([\w-]+)/i);
     const name = m01 ? m01[1].toUpperCase() : file.name.replace(/\.[^.]+$/, '').toUpperCase();
     // Se o book ativo está completamente vazio (sem fonte e sem layout), usa ele
@@ -292,10 +296,11 @@ function bkRunParse() {
 }
 
 function bkSummary(book) {
-  const leaves = book.layout.filter(f => !f.isGroup && !f.redefGroup);
+  const leaves = book.layout.filter(f => !f.isGroup && !f.redefGroup && !f.is88);
   const total  = leaves.reduce((a, f) => a + f.size, 0);
   const redefN = book.layout.filter(f => f.redefines).length;
-  return `${book.layout.length} entradas | ${leaves.length} folhas | ${redefN} REDEFINES | Total: ${total} bytes`;
+  const cond88 = book.layout.filter(f => f.is88).length;
+  return `${book.layout.length} entradas | ${leaves.length} folhas | ${redefN} REDEFINES | ${cond88 ? cond88 + ' cond-88 | ' : ''}Total: ${total} bytes`;
 }
 
 // ================================================================
@@ -351,6 +356,7 @@ function bkParseCopybook(src) {
   }
 
   // ---- Parse das linhas já unificadas ----
+  let _lastNon88Name = null; // para vincular level 88 ao campo pai
   for (const rawLine of joined) {
     // Normaliza espaço entre tipo PIC e quantidade: "PIC X (3000)" → "PIC X(3000)"
     // Válido tanto para X, 9, A, etc.
@@ -358,12 +364,34 @@ function bkParseCopybook(src) {
     const m = reLine.exec(line);
     if (!m) continue;
     const level = parseInt(m[1], 10);
-    if (level === 66 || level === 88) continue;
+    if (level === 66) continue;
+
+    // ---- Nível 88 — condition-name (sem PIC, não ocupa bytes) ----
+    if (level === 88) {
+      const name88 = m[2].toUpperCase();
+      const valMatch = line.match(/\bVALUES?\s+(.+?)\.?\s*$/i);
+      const condValues = [];
+      if (valMatch) {
+        const raw88 = valMatch[1];
+        const vRe88 = /'([^']*)'|"([^"]*)"|([^\s,]+)/g;
+        let vm88;
+        while ((vm88 = vRe88.exec(raw88)) !== null) {
+          const tok = vm88[1] !== undefined ? vm88[1] : (vm88[2] !== undefined ? vm88[2] : vm88[3]);
+          if (tok && !/^(THRU|THROUGH|,|\.)$/i.test(tok)) condValues.push(tok.toUpperCase());
+        }
+      }
+      fields.push({ level: 88, name: name88, redefines: null, pic: null, usage: null,
+                    size: 0, isGroup: false, is88: true,
+                    parentName: _lastNon88Name, condValues });
+      continue;
+    }
+
     const name      = m[2].toUpperCase();
     const redefines = m[3] ? m[3].toUpperCase() : null;
     const pic       = m[4] ? m[4].toUpperCase().replace(/\.$/, '') : null;
     const usage     = m[5] ? m[5].toUpperCase() : null;
     fields.push({ level, name, redefines, pic, usage, size: pic ? bkPicSize(pic, usage) : 0, isGroup: !pic });
+    _lastNon88Name = name; // atualiza referência para nível 88 seguintes
   }
   return fields;
 }
@@ -449,10 +477,10 @@ function bkBuildLayout(fields) {
   }
   mapAll(roots);
 
-  // 3. Tamanho total de grupo (ignora filhos REDEFINES)
+  // 3. Tamanho total de grupo (ignora filhos REDEFINES e nível 88)
   function groupSize(node) {
     if (!node.isGroup) return node.size;
-    return node.children.filter(c => !c.redefines).reduce((acc, c) => acc + groupSize(c), 0);
+    return node.children.filter(c => !c.redefines && !c.is88).reduce((acc, c) => acc + groupSize(c), 0);
   }
 
   // 4. Atribui offsets recursivamente
@@ -477,7 +505,7 @@ function bkBuildLayout(fields) {
         node.size = groupSize(node);
       }
       node.end = node.offset + node.size;
-      if (!node.redefines) {
+      if (!node.redefines && !node.is88) {
         cursor += node.isGroup ? groupSize(node) : node.size;
       }
     }
@@ -559,6 +587,7 @@ function bkBuildLayout(fields) {
   // textOffset = posição no arquivo texto (acumulado por displaySizes).
   flat.forEach(f => {
     if (f.isGroup) { f.displaySize = 0; return; }
+    if (f.is88)    { f.displaySize = 0; return; }
     if (f.isVarcharLen) { f.displaySize = 0; return; }
     const u = (f.usage || '').toUpperCase();
     if (!u || u === 'DISPLAY' || u === 'POINTER') {
@@ -573,7 +602,7 @@ function bkBuildLayout(fields) {
     }
   });
   // Campos base (sem REDEFINES): textOffset sequencial por displaySize
-  const _bkBaseL = flat.filter(f => !f.isGroup && !f.redefGroup).sort((a, b) => a.offset - b.offset);
+  const _bkBaseL = flat.filter(f => !f.isGroup && !f.redefGroup && !f.is88).sort((a, b) => a.offset - b.offset);
   let _bkTc = 0;
   for (const f of _bkBaseL) { f.textOffset = _bkTc; _bkTc += f.displaySize; }
   // Campos de variantes REDEFINES: textOffset relativo ao início do bloco redefinido
@@ -611,7 +640,7 @@ function bkRenderStats() {
   const sb   = document.getElementById('bk-stats-bar');
   sb.style.display = 'none';
   if (!book || !book.layout.length) return;
-  const leaves = book.layout.filter(f => !f.isGroup && !f.redefGroup);
+  const leaves = book.layout.filter(f => !f.isGroup && !f.redefGroup && !f.is88);
   const total  = _bkLayoutBinMode
     ? leaves.reduce((a, f) => a + f.size, 0)
     : leaves.reduce((a, f) => a + (f.displaySize !== undefined ? f.displaySize : f.size), 0);
@@ -646,6 +675,25 @@ function bkRenderTable() {
   {
     book.layout.forEach(f => {
       const indent  = Math.max(0, (f.level - 1) * 14);
+
+      // ---- Nível 88: linha especial de condition-name ----
+      if (f.is88) {
+        const tr88 = document.createElement('tr');
+        tr88.classList.add('bk-row-88');
+        const vals88 = (f.condValues && f.condValues.length)
+          ? f.condValues.map(v => `'${v}'`).join(', ')
+          : '—';
+        tr88.innerHTML = `
+          <td style="color:#bbb;font-size:11px;">${rowNum++}</td>
+          <td><span style="color:#f0c040;font-weight:700">88</span></td>
+          <td><span style="padding-left:${indent}px;color:#f0c040">${f.name}</span></td>
+          <td colspan="5"><span class="bk-88-badge" title="condition-name: pai=${f.parentName || '?'}">&#9654; VALUES: ${vals88}</span></td>
+          <td></td>
+        `;
+        tbody.appendChild(tr88);
+        return;
+      }
+
       const typeCls = f.isGroup ? 'bk-td-group' : (f.type === 'NUM' ? 'bk-td-num' : 'bk-td-alfa');
       // Modo binário: usa offset/size físico COBOL; modo texto: usa textOffset/displaySize
       const tOff    = _bkLayoutBinMode ? f.offset
@@ -717,7 +765,7 @@ function bkRenderMap() {
     title.textContent = book.name;
     sec.appendChild(title);
 
-    const baseLeaves = book.layout.filter(f => !f.isGroup && f.redefGroup === null);
+    const baseLeaves = book.layout.filter(f => !f.isGroup && f.redefGroup === null && !f.is88);
     if (!baseLeaves.length) { sec.innerHTML += '<div class="bk-empty">Sem campos base.</div>'; mc.appendChild(sec); return; }
 
     const totalBytes = baseLeaves.reduce((a, f) => a + f.size, 0) || 1;
@@ -807,12 +855,20 @@ function bkRenderTreeNode(node) {
   wrap.className = 'bk-tree-node';
   const line = document.createElement('div');
   line.className = 'bk-tree-line';
-  const posInfo = node.isGroup
-    ? `<span class="bk-tree-pos">(grupo&nbsp;${node.size}&nbsp;bytes&nbsp;${node.offset + 1}&ndash;${node.offset + node.size})</span>`
-    : `<span class="bk-tree-pic">PIC ${node.pic}</span><span class="bk-tree-pos">(${node.size}&nbsp;bytes&nbsp;${node.offset + 1}&ndash;${node.offset + node.size})</span>`;
+  let posInfo;
+  if (node.is88) {
+    const vals = (node.condValues && node.condValues.length)
+      ? node.condValues.map(v => `'${v}'`).join(', ')
+      : '—';
+    posInfo = `<span class="bk-tree-88-vals" title="condition-name: pai=${node.parentName || '?'}">&#9654; VALUES: ${vals}</span>`;
+  } else if (node.isGroup) {
+    posInfo = `<span class="bk-tree-pos">(grupo&nbsp;${node.size}&nbsp;bytes&nbsp;${node.offset + 1}&ndash;${node.offset + node.size})</span>`;
+  } else {
+    posInfo = `<span class="bk-tree-pic">PIC ${node.pic}</span><span class="bk-tree-pos">(${node.size}&nbsp;bytes&nbsp;${node.offset + 1}&ndash;${node.offset + node.size})</span>`;
+  }
   line.innerHTML = `
-    <span class="bk-tree-lvl">${String(node.level).padStart(2, '0')}</span>
-    <span class="bk-tree-name">${node.name}</span>
+    <span class="bk-tree-lvl${node.is88 ? ' bk-tree-lvl88' : ''}">${String(node.level).padStart(2, '0')}</span>
+    <span class="bk-tree-name${node.is88 ? ' bk-tree-name88' : ''}">${node.name}</span>
     ${posInfo}
     ${node.redefines ? `<span class="bk-tree-redef">REDEFINES ${node.redefines}</span>` : ''}
   `;
