@@ -323,7 +323,7 @@ function bkParseCopybook(src) {
     if (raw.length >= 7 && raw[0] >= '0' && raw[0] <= '9') {
       // ── Formato fixo (linha começa com área de sequência numérica) ──
       const ind = raw[6]; // col 7 = indicador
-      if (ind === '*' || ind === '/') continue; // comentário
+      if (ind === '*' || ind === '/' || ind === 'D' || ind === 'd') continue; // comentário / debug
       if (ind === '-') {
         // Indicador de continuação: cola SEM espaço à linha anterior
         // (normalmente para literais ou identificadores cortados na col 72)
@@ -349,6 +349,9 @@ function bkParseCopybook(src) {
 
     // Comentário estilo livre
     if (trimmed.startsWith('*') || trimmed.startsWith('/')) continue;
+
+    // Diretivas do compilador (não são declarações COBOL de dados)
+    if (/^(?:SKIP[123]|EJECT|COPY\s|REPLACE\s|TITLE\s)/i.test(trimmed)) continue;
 
     // Permite prefixo não-COBOL antes do número de nível (ex: anotações de editor)
     // Só faz o strip se o resultado for uma declaração COBOL completa (nível + nome),
