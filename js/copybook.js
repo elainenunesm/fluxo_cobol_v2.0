@@ -351,10 +351,12 @@ function bkParseCopybook(src) {
     if (trimmed.startsWith('*') || trimmed.startsWith('/')) continue;
 
     // Permite prefixo não-COBOL antes do número de nível (ex: anotações de editor)
+    // Só faz o strip se o resultado for uma declaração COBOL completa (nível + nome),
+    // evitando que palavras-chave como PIC, REDEFINES, OCCURS sejam erroneamente removidas.
     let codeLine = trimmed;
     if (!/^\d/.test(codeLine)) {
       const stripped = codeLine.replace(/^\S+\s+/, '').trim();
-      if (/^\d/.test(stripped)) codeLine = stripped;
+      if (/^\d{1,2}\s+[\w-]/.test(stripped)) codeLine = stripped;
     }
 
     // ── Decisão de continuação ──────────────────────────────────────────
