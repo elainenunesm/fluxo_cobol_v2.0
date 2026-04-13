@@ -353,13 +353,17 @@ function bkParseCopybook(src) {
     // Diretivas do compilador (não são declarações COBOL de dados)
     if (/^(?:SKIP[123]|EJECT|COPY\s|REPLACE\s|TITLE\s)/i.test(trimmed)) continue;
 
-    // Permite prefixo não-COBOL antes do número de nível (ex: anotações de editor)
-    // Só faz o strip se o resultado for uma declaração COBOL completa (nível + nome),
-    // evitando que palavras-chave como PIC, REDEFINES, OCCURS sejam erroneamente removidas.
+    // Permite prefixo numérico (número de sequência embutido em formato livre)
+    // SOMENTE strip se o prefixo for puramente dígitos (ex: "000010 05 CAMPO PIC X").
+    // Palavras como NOTE, COMMENT, REMARK, nomes de campos NOT são stripadas —
+    // serão tratadas como continuação ou ignoradas pelo baseMatch na fase de parse.
     let codeLine = trimmed;
     if (!/^\d/.test(codeLine)) {
-      const stripped = codeLine.replace(/^\S+\s+/, '').trim();
-      if (/^\d{1,2}\s+[\w-]/.test(stripped)) codeLine = stripped;
+      const firstTok = codeLine.match(/^(\d+)\s+/);
+      if (firstTok) {
+        const stripped = codeLine.slice(firstTok[0].length).trim();
+        if (/^\d{1,2}\s+[\w-]/.test(stripped)) codeLine = stripped;
+      }
     }
 
     // ── Decisão de continuação ──────────────────────────────────────────
@@ -386,8 +390,13 @@ function bkParseCopybook(src) {
     if (!baseMatch) continue;
     const level = parseInt(baseMatch[1], 10);
     if (level === 66) continue;
+    // Níveis COBOL válidos: 01-49, 77, 88 (66 já tratado acima)
+    if (!((level >= 1 && level <= 49) || level === 77 || level === 88)) continue;
 
     const name = baseMatch[2].toUpperCase();
+    // Nome COBOL válido deve conter ao menos uma letra (evita "03", "10" etc. gerados
+    // por mangling de área de sequência em formato fixo com 7+ dígitos)
+    if (!/[A-Z]/.test(name)) continue;
     // rest = tudo depois do nome (remove ponto final)
     const rest = ' ' + line.slice(baseMatch[0].length).replace(/\.\s*$/, '').trim() + ' ';
 
