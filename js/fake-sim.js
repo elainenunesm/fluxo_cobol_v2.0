@@ -1635,23 +1635,36 @@ function fakeSimRunAll() {
   // Inicia overlay de progresso
   _fakeSimBatchShowProgress();
 
-  // Inicializa variáveis do programa (uma única vez)
+  // ── RESTART COMPLETO: limpa relatório e estado do simulador ──
+  // Limpa cenários de execuções anteriores
+  if (typeof _repScenarios !== 'undefined') {
+    _repScenarios  = [];
+    _fakeSimBatchOrigMaxScenarios = 999; // temporariamente ilimitado
+  }
+  if (typeof _repCurrent !== 'undefined')    _repCurrent    = null;
+  if (typeof _repScenarioId !== 'undefined') _repScenarioId = 0;
+
+  // Reinicializa variáveis do programa do zero (parseando o código novamente)
   var code = (document.getElementById('input') || {}).value || '';
   _simInitVars(code);
+
+  // Salva snapshot limpo das vars e das tabelas DB2 (ANTES de qualquer injeção)
+  // para que cada caminho comece a partir do mesmo estado inicial
+  _fakeSimBatchCleanVars = Object.assign({}, _simVars || {});
+  _fakeSimBatchCleanVarsInitial = Object.assign({}, _simVarsInitial || {});
+  _fakeSimBatchCleanDb2  = JSON.parse(JSON.stringify(_simDb2Tables || {}));
 
   // Ativa o simulador em modo headless (sem UI)
   _simHeadless = true;
   _sim.on      = true;
 
-  // Aumenta o limite de cenários para acomodar até MAX_PATHS=80
-  if (typeof _repScenarios !== 'undefined') {
-    _fakeSimBatchOrigMaxScenarios = 999; // temporariamente ilimitado
-  }
-
   _fakeSimBatchRunIdx(0);
 }
 
 var _fakeSimBatchOrigMaxScenarios = 50;
+var _fakeSimBatchCleanVars        = null; // snapshot limpo de _simVars (pós _simInitVars)
+var _fakeSimBatchCleanVarsInitial = null; // snapshot limpo de _simVarsInitial
+var _fakeSimBatchCleanDb2         = null; // snapshot limpo de _simDb2Tables
 
 /**
  * Executa o caminho no índice `idx` da lista; ao terminar, avança para idx+1.
@@ -1691,6 +1704,8 @@ function _fakeSimRunOneHeadless(path, onDone) {
   _fakeSimInjectData(path);
 
   // ── 3. Reseta estado do simulador sem abrir UI ──
+  //    Restaura vars e DB2 ao estado limpo do início do lote,
+  //    garantindo que cada caminho começa do zero (não herda lixo do anterior).
   clearTimeout(_sim.timer);
   _sim.currentId  = null;
   _sim.step       = 0;
@@ -1703,6 +1718,14 @@ function _fakeSimRunOneHeadless(path, onDone) {
   _simLoopState   = {};
   _simNodeHits    = {};
   _simParaSeq     = [];
+  // Restaura variáveis e tabelas DB2 ao estado inicial do lote
+  if (_fakeSimBatchCleanVars) {
+    _simVars        = Object.assign({}, _fakeSimBatchCleanVars);
+    _simVarsInitial = Object.assign({}, _fakeSimBatchCleanVarsInitial || _fakeSimBatchCleanVars);
+  }
+  if (_fakeSimBatchCleanDb2) {
+    _simDb2Tables = JSON.parse(JSON.stringify(_fakeSimBatchCleanDb2));
+  }
   if (typeof _simResetFilePointers === 'function') _simResetFilePointers();
 
   // ── 4. Aplica variáveis geradas para este caminho ──
