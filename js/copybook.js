@@ -310,14 +310,12 @@ function bkSummary(book) {
 // PARSER COBOL
 // ================================================================
 function bkParseCopybook(src) {
-  // Suporta PIC/PICTURE, com ou sem IS: "PIC S9(8)V99", "PICTURE IS X(10)"
-  const reLine = /^\s*(\d{1,2})\s+([\w-]+)(?:\s+REDEFINES\s+([\w-]+))?\s*(?:PIC(?:TURE)?\s+(?:IS\s+)?([\w9XABVSPZn()/.,+\-*$]+))?\s*(?:USAGE\s+)?(COMP(?:-[1-5])?|COMPUTATIONAL(?:-[1-5])?|BINARY|PACKED-DECIMAL|DISPLAY|POINTER)?\s*(?:VALUE\s+.*)?\.?\s*$/i;
   const fields = [];
 
   // ---- Pré-proc: junta linhas de continuação ----
-  // Uma linha de continuação começa com PIC/REDEFINES/VALUE (sem número de nível)
+  // Uma linha de continuação começa com qualquer cláusula COBOL (sem número de nível)
   // e é colada ao final da linha anterior.
-  const reContinuation = /^\s*(?:PIC|REDEFINES|VALUE)\b/i;
+  const reContinuation = /^\s*(?:PIC(?:TURE)?|REDEFINES|VALUES?|USAGE|IS\s|OCCURS|INDEXED|DEPENDING|JUSTIFIED|JUST|SYNC(?:HRONIZED)?)\b/i;
   const rawLines = src.split(/\r\n|\r|\n/); // suporta Windows CRLF, Mac \r e Unix \n
   const joined = [];
   for (const raw of rawLines) {
@@ -359,19 +357,25 @@ function bkParseCopybook(src) {
   }
 
   // ---- Parse das linhas já unificadas ----
+  // Estratégia: extrai cada cláusula com regex individual (robusto a ordem e cláusulas extras
+  // como OCCURS, INDEXED BY, DEPENDING ON, JUSTIFIED, SYNC, etc.).
   let _lastNon88Name = null; // para vincular level 88 ao campo pai
   for (const rawLine of joined) {
     // Normaliza espaço entre tipo PIC e quantidade: "PIC X (3000)" → "PIC X(3000)"
-    // Válido tanto para X, 9, A, etc.
     const line = rawLine.replace(/\b(PIC\s+[\w9XABVSPZn*]+)\s+\(/gi, '$1(');
-    const m = reLine.exec(line);
-    if (!m) continue;
-    const level = parseInt(m[1], 10);
+
+    // Deve começar com número de nível (1-2 dígitos) seguido do nome do campo
+    const baseMatch = /^\s*(\d{1,2})\s+([\w-]+)/i.exec(line);
+    if (!baseMatch) continue;
+    const level = parseInt(baseMatch[1], 10);
     if (level === 66) continue;
+
+    const name = baseMatch[2].toUpperCase();
+    // rest = tudo depois do nome (remove ponto final)
+    const rest = ' ' + line.slice(baseMatch[0].length).replace(/\.\s*$/, '').trim() + ' ';
 
     // ---- Nível 88 — condition-name (sem PIC, não ocupa bytes) ----
     if (level === 88) {
-      const name88 = m[2].toUpperCase();
       const valMatch = line.match(/\bVALUES?\s+(.+?)\.?\s*$/i);
       const condValues = [];
       if (valMatch) {
@@ -383,17 +387,38 @@ function bkParseCopybook(src) {
           if (tok && !/^(THRU|THROUGH|,|\.)$/i.test(tok)) condValues.push(tok.toUpperCase());
         }
       }
-      fields.push({ level: 88, name: name88, redefines: null, pic: null, usage: null,
+      fields.push({ level: 88, name, redefines: null, pic: null, usage: null,
                     size: 0, isGroup: false, is88: true,
                     parentName: _lastNon88Name, condValues });
       continue;
     }
 
-    const name      = m[2].toUpperCase();
-    const redefines = m[3] ? m[3].toUpperCase() : null;
-    const pic       = m[4] ? m[4].toUpperCase().replace(/\.$/, '') : null;
-    const usage     = m[5] ? m[5].toUpperCase() : null;
-    fields.push({ level, name, redefines, pic, usage, size: pic ? bkPicSize(pic, usage) : 0, isGroup: !pic });
+    // ---- Extração individual de cláusulas (ordem não importa) ----
+    // REDEFINES
+    const redefM   = /\bREDEFINES\s+([\w-]+)/i.exec(rest);
+    const redefines = redefM ? redefM[1].toUpperCase() : null;
+
+    // PIC / PICTURE
+    const picM = /\bPIC(?:TURE)?\s+(?:IS\s+)?([\w9XABVSPZn()/.,+\-*$]+)/i.exec(rest);
+    const pic  = picM ? picM[1].toUpperCase().replace(/\.$/, '') : null;
+
+    // USAGE (explícito "USAGE [IS] COMP-3" ou implícito "COMP-3" sozinho)
+    const usageValRe = /COMP(?:-[1-5])?|COMPUTATIONAL(?:-[1-5])?|BINARY|PACKED-DECIMAL|DISPLAY|POINTER/i;
+    const usageExpl  = new RegExp('\\bUSAGE\\s+(?:IS\\s+)?(' + usageValRe.source + ')\\b', 'i').exec(rest);
+    const usageBare  = usageExpl ? null : new RegExp('\\b(' + usageValRe.source + ')\\b', 'i').exec(rest);
+    const usage = usageExpl ? usageExpl[1].toUpperCase()
+                : usageBare ? usageBare[1].toUpperCase()
+                : null;
+
+    // OCCURS (toma o primeiro número — ocorrências fixas)
+    const occursM = /\bOCCURS\s+(\d+)\b/i.exec(rest);
+    const occurs  = occursM ? parseInt(occursM[1], 10) : 1;
+
+    const baseSize = pic ? bkPicSize(pic, usage) : 0;
+    const size     = baseSize * occurs;
+    const isGroup  = !pic;
+
+    fields.push({ level, name, redefines, pic, usage, size, isGroup });
     _lastNon88Name = name; // atualiza referência para nível 88 seguintes
   }
   return fields;
@@ -1133,17 +1158,15 @@ function bkDataAutoVariant(raw, book) {
       // AND: todas as condições devem bater
       const allMatch = activeConds.every(c => {
         // Busca o campo preferindo o campo do próprio layout do candidato:
-        // - base (candidate === target): prefere campos sem redefGroup
-        // - variante (candidate !== target): prefere campos com redefGroup === candidate
-        // Isso evita que campos com nomes duplicados entre base e variantes
-        // sejam resolvidos com o offset errado (ex: TIPO-RE2 no base em offset 12
-        // vs. TIPO-RE2 na variante em offset 0).
         const kf = book.layout.find(f =>
             f.name === c.keyField && !f.isGroup &&
             (candidate !== target ? f.redefGroup === candidate : !f.redefGroup)
           ) || book.layout.find(f => f.name === c.keyField && !f.isGroup);
         if (!kf) return false;
-        const keyVal = (raw || '').substring(kf.offset, kf.offset + kf.size).trim();
+        // Usa posição texto (textOffset/displaySize) — raw está sempre em formato texto
+        const to     = kf.textOffset  !== undefined ? kf.textOffset  : kf.offset;
+        const ds     = kf.displaySize !== undefined ? kf.displaySize : kf.size;
+        const keyVal = (raw || '').substring(to, to + ds).trim();
         return keyVal === c.value.trim();
       });
       if (allMatch) return candidate;
@@ -1693,8 +1716,8 @@ function bkDataDecodeRawPaste() {
   const bar = document.getElementById('bk-data-raw-bar');
   if (bar) bar.classList.add('hidden');
   if (!lines.length) return;
-  const recLen    = book.layout.filter(f => !f.isGroup)
-                      .reduce((m, f) => Math.max(m, f.offset + f.size), 0);
+  const recLen    = book.layout.filter(f => !f.isGroup && !f.is88)
+                      .reduce((m, f) => Math.max(m, (f.textOffset || 0) + (f.displaySize !== undefined ? f.displaySize : f.size)), 0);
   const recPad    = Math.max(recLen, 1);
   const total     = Math.min(lines.length, _BK_MAX_ROWS);
   const truncated = lines.length > _BK_MAX_ROWS;
