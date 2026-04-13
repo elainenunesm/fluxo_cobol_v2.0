@@ -1017,10 +1017,25 @@ function bkGetRedefGroups(book) {
   // REDEFINES internos (redefType === 'internal') são alias de campo e NÃO
   // criam variantes de layout — ficam fora dos grupos de seleção.
   const topRedef = book.layout.filter(f => f.redefines && f.redefGroup === f.name && f.redefType === 'layout');
+
+  // Mapeia nome → nó variante (para percorrer cadeia de REDEFINES)
+  const variantByName = {};
+  topRedef.forEach(f => { variantByName[f.name] = f; });
+
+  // Aplaina cadeias: 01 A, 01 B REDEFINES A, 01 C REDEFINES B
+  // → B e C são ambos variantes de A (mesma área de memória).
+  // Percorre a cadeia até encontrar o nó que NÃO é uma variante.
+  function ultimateBase(name) {
+    const node = variantByName[name];
+    if (!node) return name;          // não é variante → é a base original
+    return ultimateBase(node.redefines);
+  }
+
   const byTarget = {};
   topRedef.forEach(f => {
-    if (!byTarget[f.redefines]) byTarget[f.redefines] = [];
-    byTarget[f.redefines].push(f.name);
+    const base = ultimateBase(f.redefines);
+    if (!byTarget[base]) byTarget[base] = [];
+    if (!byTarget[base].includes(f.name)) byTarget[base].push(f.name);
   });
   return byTarget;
 }
