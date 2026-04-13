@@ -332,30 +332,23 @@ function bkParseCopybook(src) {
     let codeStr;
 
     // ── Padrão COBOL fixed-format: col 7 (índice 6) é SEMPRE o indicador ──
-    // Aplica para qualquer linha com >= 7 chars, independente do conteúdo
-    // dos 6 primeiros bytes (dígitos, espaços ou letras como "COPY01", "REC001").
-    if (raw.length >= 7) {
-      const ind  = raw[6];
-      const seq6 = raw.substring(0, 6);
-      // Área de sequência: dígitos, espaços ou rótulo alfanumérico sem espaços (ex: COPY01)
-      const hasSeqArea = /^[\d ]+$/.test(seq6) || /^[A-Za-z0-9]{1,6}$/.test(seq6);
-      if (hasSeqArea) {
-        if (ind === '*' || ind === '/') continue; // comentário / eject
-        if (ind === 'D' || ind === 'd') continue; // debug line (ignorada)
-        if (ind === '-') {
-          // Indicador de continuação: cola SEM espaço à linha anterior
-          const cont = raw.substring(7, 72).replace(/^\s+/, '');
-          if (cont && joined.length) joined[joined.length - 1] += cont;
-          continue;
-        }
-        // Extrai apenas código (cols 8-72 = índices 7-71)
-        codeStr = raw.substring(7, 72);
-      } else {
-        // ── Formato livre: linha não tem área de sequência standard ──
-        codeStr = raw.substring(0, 72);
+    // Em COBOL fixed-format, col 7 só pode ser: espaço, *, /, -, D, d.
+    // Se col 7 for qualquer outro caractere (dígito, letra), a linha é formato livre
+    // e o código começa na col 1 (sem área de sequência).
+    if (raw.length >= 7 && ' */\-Dd'.includes(raw[6])) {
+      const ind = raw[6];
+      if (ind === '*' || ind === '/') continue; // comentário / eject
+      if (ind === 'D' || ind === 'd') continue; // debug line (ignorada)
+      if (ind === '-') {
+        // Indicador de continuação: cola SEM espaço à linha anterior
+        const cont = raw.substring(7, 72).replace(/^\s+/, '');
+        if (cont && joined.length) joined[joined.length - 1] += cont;
+        continue;
       }
+      // Indicador = espaço → código em cols 8-72
+      codeStr = raw.substring(7, 72);
     } else {
-      // Linha curta demais para ter área de sequência
+      // ── Formato livre: col 7 não é indicador válido (ou linha curta) ──
       codeStr = raw.substring(0, 72);
     }
 
