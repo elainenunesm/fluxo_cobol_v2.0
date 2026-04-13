@@ -1155,10 +1155,24 @@ function _fakeSimInjectData(path) {
   Object.keys(_simDb2Tables).forEach(function(tblName) {
     var tbl = _simDb2Tables[tblName];
     if (!tbl) return;
-    // Pula só se não há colunas E não há fallback via selectMaps.into
-    var hasCols = tbl.columns.length > 0 ||
-      (tbl.selectMaps && tbl.selectMaps.length && tbl.selectMaps[0].into.length > 0);
-    if (!hasCols) return;
+    // Quando não há colunas conhecidas, tenta derivá-las de:
+    // 1) selectMaps[0].into (variáveis do INTO)
+    // 2) whereMaps (colunas da cláusula WHERE)
+    // 3) variáveis de WORKING-STORAGE que batem pelo nome (sem prefixo WS-)
+    if (!tbl.columns.length) {
+      if (tbl.selectMaps && tbl.selectMaps.length && tbl.selectMaps[0].into.length) {
+        tbl.columns = tbl.selectMaps[0].into.slice();
+      } else if (tbl.whereMaps && tbl.whereMaps.length) {
+        // Usa os nomes das colunas do WHERE como estrutura mínima
+        var wCols = [];
+        tbl.whereMaps.forEach(function(wm) {
+          Object.keys(wm).forEach(function(col) { if (wCols.indexOf(col) < 0) wCols.push(col); });
+        });
+        if (wCols.length) tbl.columns = wCols;
+      }
+    }
+    // Pula somente se nenhum mecanismo conseguiu determinar colunas
+    if (!tbl.columns.length) return;
     if (tbl.rows && tbl.rows.length > 0) return;
     var isUsed = path.meta.sqlOps.some(function(op){ return op.toUpperCase().indexOf(tblName) >= 0; });
     if (!isUsed && path.meta.sqlOps.length === 0) isUsed = true;
@@ -1777,10 +1791,7 @@ function _fakeSimRunOneHeadless(path, onDone) {
   _fakeSimBranchQueueIdx = 0;
   _fakeSimActive         = true;
 
-  // ── 2. Injeta dados fictícios (arquivos, DB2) ──
-  _fakeSimInjectData(path);
-
-  // ── 3. Reseta estado do simulador sem abrir UI ──
+  // ── 2. Reseta estado do simulador sem abrir UI ──
   //    Restaura vars e DB2 ao estado limpo do início do lote,
   //    garantindo que cada caminho começa do zero (não herda lixo do anterior).
   clearTimeout(_sim.timer);
@@ -1805,13 +1816,18 @@ function _fakeSimRunOneHeadless(path, onDone) {
   }
   if (typeof _simResetFilePointers === 'function') _simResetFilePointers();
 
-  // ── 4. Aplica variáveis geradas para este caminho ──
+  // ── 3. Aplica variáveis geradas para este caminho ──
   Object.keys(_fakeSimGeneratedVars).forEach(function(k) {
     if (_simVars.hasOwnProperty(k)) {
       _simVars[k]        = _fakeSimGeneratedVars[k];
       _simVarsInitial[k] = _fakeSimGeneratedVars[k];
     }
   });
+
+  // ── 4. Injeta dados fictícios (arquivos, DB2) — APÓS restaurar estado limpo ──
+  // Deve ser chamada depois da restauração para não ser sobrescrita.
+  // Usa _fakeSimGeneratedVars (já calculado) para fazer patch das chaves WHERE.
+  _fakeSimInjectData(path);
 
   // ── 5. Snapshot inicial DB2 (normalmente feito em simPlay) ──
   _simDb2TablesInitial = {};
