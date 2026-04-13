@@ -5048,6 +5048,21 @@ body:not(.dark-mode) .rep-log-live  { color: #2563eb; }
 body:not(.dark-mode) .rep-log-time  { color: #94a3b8; }
 body:not(.dark-mode) .rep-log-filter-btn { background: #f0f4f8; border-color: #c9d5e0; color: #475569; }
 
+/* ── Por Caminho (bypath) — modo claro ── */
+body:not(.dark-mode) .rep-bypath-wrap { background: transparent; }
+body:not(.dark-mode) .rep-path-group { border-color: #dde2e8; }
+body:not(.dark-mode) .rep-path-group-hdr { background: #f0f4ff; }
+body:not(.dark-mode) .rep-path-group-hdr:hover { background: #e0e7ff; }
+body:not(.dark-mode) .rep-path-group-hdr--other { background: #f8f9fb; }
+body:not(.dark-mode) .rep-path-group-num { color: #3730a3; }
+body:not(.dark-mode) .rep-path-group-status { color: #64748b; }
+body:not(.dark-mode) .rep-path-group-meta { color: #94a3b8; }
+body:not(.dark-mode) .rep-path-group-arrow { color: #94a3b8; }
+body:not(.dark-mode) .rep-path-group-body { background: #fff; }
+body:not(.dark-mode) .rep-sc-path-badge { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+body:not(.dark-mode) .rep-sc-count { color: #64748b; }
+body:not(.dark-mode) .rep-btn-active { background: #4f46e5 !important; color: #fff !important; border-color: #4f46e5 !important; }
+
 /* ── Estatística Log — modo claro ── */
 body:not(.dark-mode) .rep-stats-wrap { color: #1e293b; }
 body:not(.dark-mode) .rep-section-title-sep { border-top-color: #dde2e8; }
