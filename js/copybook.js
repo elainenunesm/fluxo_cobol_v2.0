@@ -221,13 +221,15 @@ function bkDrop(e) {
 function bkLoadFile(file, forceNew) {
   const reader = new FileReader();
   reader.onload = ev => {
-    // Limita à coluna 72 APENAS linhas no formato fixo COBOL (início com dígito = área de sequência).
-    // Linhas formato livre (início com espaço/letra) não são truncadas pois podem ter código
-    // legítimo além da coluna 72 (REDEFINES, USAGE, VALUE longos, etc.).
+    // Trunca todas as linhas na col 72 para eliminar a área de identificação COBOL
+    // (cols 73-80: nº de sequência ou nome do programa gerado por editores/compiladores).
+    // Linhas fixo-formato (início com dígito): trunca substring(0,72).
+    // Linhas indentadas/formato-livre: também trunca em 72, pois o COBOL padrão
+    // define código em cols 1-72; apenas COBOL 2002+ free-format não tem esse limite,
+    // mas na prática copybooks não usam código legítimo além da col 72.
     const rawText = ev.target.result || '';
     const src = rawText.split(/\r\n|\r|\n/)
-      .map(l => (l.length > 72 && l.length >= 7 && l[0] >= '0' && l[0] <= '9')
-            ? l.substring(0, 72) : l)
+      .map(l => l.length > 72 ? l.substring(0, 72) : l)
       .join('\n');
     const m01  = src.match(/\b01\s+([\w-]+)/i);
     const name = m01 ? m01[1].toUpperCase() : file.name.replace(/\.[^.]+$/, '').toUpperCase();
@@ -313,22 +315,31 @@ function bkParseCopybook(src) {
   const fields = [];
 
   // ---- Pré-proc: junta linhas de continuação ----
-  // Uma linha de continuação começa com qualquer cláusula COBOL (sem número de nível)
-  // e é colada ao final da linha anterior.
-  const reContinuation = /^\s*(?:PIC(?:TURE)?|REDEFINES|VALUES?|USAGE|IS\s|OCCURS|INDEXED|DEPENDING|JUSTIFIED|JUST|SYNC(?:HRONIZED)?)\b/i;
-  const rawLines = src.split(/\r\n|\r|\n/); // suporta Windows CRLF, Mac \r e Unix \n
+  const rawLines = src.split(/\r\n|\r|\n/);
   const joined = [];
   for (const raw of rawLines) {
-    // COBOL formato fixo: quando o 1º char é dígito, os primeiros 6 bytes são
-    // a área de sequência e devem ser descartados. O byte 7 (índice 6) é o
-    // indicador: '*' ou '/' = comentário, ' ' ou '-' = código.
-    // Quando o 1º char é espaço (formato livre / indentado), usa a linha completa.
     let codeStr;
+
     if (raw.length >= 7 && raw[0] >= '0' && raw[0] <= '9') {
-      if (raw[6] === '*' || raw[6] === '/') continue; // comentário fixo
-      codeStr = raw.substring(7);                     // área de código (cols 8+)
+      // ── Formato fixo (linha começa com área de sequência numérica) ──
+      const ind = raw[6]; // col 7 = indicador
+      if (ind === '*' || ind === '/') continue; // comentário
+      if (ind === '-') {
+        // Indicador de continuação: cola SEM espaço à linha anterior
+        // (normalmente para literais ou identificadores cortados na col 72)
+        const cont = raw.substring(7, 72).replace(/^\s+/, '');
+        if (cont && joined.length) joined[joined.length - 1] += cont;
+        continue;
+      }
+      // Extrai apenas a área de código (cols 8-72 = índices 7-71)
+      // Ignora área de identificação (cols 73-80) que ferramentas de edição
+      // costumam colocar após a col 72 (nome do programa, nº de sequência etc.)
+      codeStr = raw.substring(7, 72);
     } else {
-      codeStr = raw;                                  // formato livre
+      // ── Formato livre / indentado sem número de sequência ──
+      // Também trunca em 72 para eliminar possível área de identificação
+      // aposta por ferramentas que adicionam sequence numbers no final da linha.
+      codeStr = raw.substring(0, 72);
     }
 
     // Remove comentário inline estilo livre (*> ...)
@@ -339,17 +350,20 @@ function bkParseCopybook(src) {
     // Comentário estilo livre
     if (trimmed.startsWith('*') || trimmed.startsWith('/')) continue;
 
-    // Se a linha não começa com dígito (número de nível COBOL), tenta descartar
-    // um prefixo de anotação/palavra não-COBOL (ex: "aqui 01 CAMPO PIC X.")
-    // preservando o restante a partir do primeiro dígito encontrado.
+    // Permite prefixo não-COBOL antes do número de nível (ex: anotações de editor)
     let codeLine = trimmed;
     if (!/^\d/.test(codeLine)) {
       const stripped = codeLine.replace(/^\S+\s+/, '').trim();
       if (/^\d/.test(stripped)) codeLine = stripped;
     }
 
-    if (reContinuation.test(codeLine) && joined.length) {
-      // Linha de continuação: anexa à linha anterior com espaço
+    // ── Decisão de continuação ──────────────────────────────────────────
+    // Em COBOL, toda nova declaração começa com um número de nível (1-49, 66, 77, 88).
+    // Se a linha não começa com número-de-nível + nome, é continuação da declaração anterior.
+    // Isso é mais robusto que verificar palavras-chave específicas (PIC, REDEFINES, etc.)
+    // pois funciona para qualquer cláusula em qualquer ordem.
+    const isNewDecl = /^\d{1,2}\s+[\w-]/.test(codeLine);
+    if (!isNewDecl && joined.length) {
       joined[joined.length - 1] += ' ' + codeLine;
     } else {
       joined.push(codeLine);
@@ -357,9 +371,7 @@ function bkParseCopybook(src) {
   }
 
   // ---- Parse das linhas já unificadas ----
-  // Estratégia: extrai cada cláusula com regex individual (robusto a ordem e cláusulas extras
-  // como OCCURS, INDEXED BY, DEPENDING ON, JUSTIFIED, SYNC, etc.).
-  let _lastNon88Name = null; // para vincular level 88 ao campo pai
+  let _lastNon88Name = null;
   for (const rawLine of joined) {
     // Normaliza espaço entre tipo PIC e quantidade: "PIC X (3000)" → "PIC X(3000)"
     const line = rawLine.replace(/\b(PIC\s+[\w9XABVSPZn*]+)\s+\(/gi, '$1(');
@@ -395,14 +407,16 @@ function bkParseCopybook(src) {
 
     // ---- Extração individual de cláusulas (ordem não importa) ----
     // REDEFINES
-    const redefM   = /\bREDEFINES\s+([\w-]+)/i.exec(rest);
+    const redefM    = /\bREDEFINES\s+([\w-]+)/i.exec(rest);
     const redefines = redefM ? redefM[1].toUpperCase() : null;
 
-    // PIC / PICTURE
+    // PIC / PICTURE — para na fronteira da palavra (espaço ou ponto)
     const picM = /\bPIC(?:TURE)?\s+(?:IS\s+)?([\w9XABVSPZn()/.,+\-*$]+)/i.exec(rest);
-    const pic  = picM ? picM[1].toUpperCase().replace(/\.$/, '') : null;
+    // Extrai apenas até o primeiro espaço para evitar capturar área de identificação
+    const picRaw = picM ? picM[1].replace(/\s.*$/, '') : null;
+    const pic    = picRaw ? picRaw.toUpperCase().replace(/\.$/, '') : null;
 
-    // USAGE (explícito "USAGE [IS] COMP-3" ou implícito "COMP-3" sozinho)
+    // USAGE (explícito ou bare)
     const usageValRe = /COMP(?:-[1-5])?|COMPUTATIONAL(?:-[1-5])?|BINARY|PACKED-DECIMAL|DISPLAY|POINTER/i;
     const usageExpl  = new RegExp('\\bUSAGE\\s+(?:IS\\s+)?(' + usageValRe.source + ')\\b', 'i').exec(rest);
     const usageBare  = usageExpl ? null : new RegExp('\\b(' + usageValRe.source + ')\\b', 'i').exec(rest);
@@ -410,7 +424,7 @@ function bkParseCopybook(src) {
                 : usageBare ? usageBare[1].toUpperCase()
                 : null;
 
-    // OCCURS (toma o primeiro número — ocorrências fixas)
+    // OCCURS (ocorrências fixas — multiplica o tamanho)
     const occursM = /\bOCCURS\s+(\d+)\b/i.exec(rest);
     const occurs  = occursM ? parseInt(occursM[1], 10) : 1;
 
@@ -419,7 +433,7 @@ function bkParseCopybook(src) {
     const isGroup  = !pic;
 
     fields.push({ level, name, redefines, pic, usage, size, isGroup });
-    _lastNon88Name = name; // atualiza referência para nível 88 seguintes
+    _lastNon88Name = name;
   }
   return fields;
 }
