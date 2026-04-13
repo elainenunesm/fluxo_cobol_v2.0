@@ -16,17 +16,28 @@ let _bkNextId   = 1;
 // ================================================================
 // EDITOR COPYBOOK — line numbers + syntax highlight (espelha o CICS/COBOL)
 // ================================================================
+const _BK_EDITOR_MAX_LINES = 5000; // limite de linhas com syntax highlight
+
 function updateBookEditor() {
   const ta = document.getElementById('book-textarea');
   const hi = document.getElementById('bk-cbl-hi');
   const ln = document.getElementById('bk-cbl-ln');
   if (!ta || !hi || !ln) return;
   const lines = ta.value.split('\n');
+  const total = lines.length;
+  // Numeração: todas as linhas (sem limite)
   ln.innerHTML = lines.map((_,i) => '<div>' + (i+1) + '</div>').join('');
-  hi.innerHTML = lines.map(line => {
+  // Highlight: limita a _BK_EDITOR_MAX_LINES para não travar o browser
+  const hiLines = total > _BK_EDITOR_MAX_LINES ? lines.slice(0, _BK_EDITOR_MAX_LINES) : lines;
+  let html = hiLines.map(line => {
     const cls = _cblLineClass(line);
     return '<div class="cbl-line' + cls + '">' + _cblHighlightLine(line) + '</div>';
   }).join('');
+  if (total > _BK_EDITOR_MAX_LINES) {
+    const rem = total - _BK_EDITOR_MAX_LINES;
+    html += '<div style="color:#666;font-style:italic;padding:4px 0;">... + ' + rem.toLocaleString('pt-BR') + ' linha(s) sem highlight</div>';
+  }
+  hi.innerHTML = html;
   hi.scrollTop  = ta.scrollTop;
   hi.scrollLeft = ta.scrollLeft;
   ln.scrollTop  = ta.scrollTop;
@@ -673,8 +684,28 @@ function bkBuildLayout(fields) {
   for (const vF of Object.values(_bkVG)) {
     vF.sort((a, b) => a.offset - b.offset);
     const minOff = vF[0].offset;
+    // O campo base cujo offset binário corresponde ao início do bloco REDEFINES
+    // pode ter offset EXATAMENTE igual a minOff (campo redefines sobrepõe campo base)
+    // ou o bloco começa logo após algum campo base (offset < minOff mas o próximo já >= minOff).
+    // Busca o campo base com maior offset que ainda seja <= minOff:
+    // se esse campo tiver offset === minOff, usamos seu textOffset diretamente.
+    // Se for menor, somamos sua displaySize para obter o início do bloco em texto.
     let baseStart = 0;
-    for (const b of _bkBaseL) { if (b.offset <= minOff) baseStart = b.textOffset; }
+    let bestBase  = null;
+    for (const b of _bkBaseL) {
+      if (b.offset <= minOff) {
+        if (!bestBase || b.offset >= bestBase.offset) bestBase = b;
+      }
+    }
+    if (bestBase) {
+      if (bestBase.offset === minOff) {
+        // O campo base começa exatamente no mesmo byte: bloco texto começa aqui
+        baseStart = bestBase.textOffset;
+      } else {
+        // O campo base termina antes: início do bloco = fim do campo base em texto
+        baseStart = bestBase.textOffset + (bestBase.displaySize || 0);
+      }
+    }
     let _vtc = baseStart;
     for (const f of vF) { f.textOffset = _vtc; _vtc += (f.displaySize || 0); }
   }
