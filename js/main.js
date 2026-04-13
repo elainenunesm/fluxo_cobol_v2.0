@@ -1241,7 +1241,16 @@ function parseCobol(code) {
       const _col7 = rawLine[6];
       if (/^[\d ]{6}/.test(rawLine) ||
           (/^[A-Za-z0-9 ]{6}/.test(rawLine) && (_col7 === ' ' || _col7 === '*' || _col7 === '/'))) {
-        normalized = rawLine.slice(6);   // retira as 6 colunas de numera��o
+        const _stripped = rawLine.slice(6);
+        // Se o strip removeria um número de nível (ex.: "    88 VAR" ou "    77 VAR"),
+        // preserva o original para não perder a declaração de nível.
+        const _luOrig  = rawLine.trim().toUpperCase();
+        const _luStrip = _stripped.trim().toUpperCase();
+        if (/^\d{1,2}\s+[A-Z@#$]/.test(_luOrig) && !/^\d{1,2}\s+[A-Z@#$]/.test(_luStrip)) {
+          normalized = rawLine; // mantém sem strip para preservar número de nível
+        } else {
+          normalized = _stripped;
+        }
       }
     }
 

@@ -61,6 +61,11 @@ function fakeSimOpen() {
       _fakeSimPaths = paths;
       _fakeSimRenderFilterBar();
       _fakeSimRenderPathList();
+      // Avisa quando limite de caminhos foi atingido
+      var countEl = document.getElementById('fake-sim-path-count');
+      if (countEl && paths.length >= 150) {
+        countEl.innerHTML = paths.length + ' caminho(s) &nbsp;<span style="color:#f59e0b;font-weight:600" title="Limite atingido — caminhos adicionais não foram explorados">⚠ limite de 150 atingido</span>';
+      }
     }
   );
 }
@@ -104,6 +109,7 @@ function _fakeSimDiscoverPathsAsync(onProgress, onDone) {
   var stack = [{ nodeId: root, visitedLoops: new Set(), branches: [], nodeSeq: [], depth: 0, meta: _initMeta }];
 
   function tick() {
+    try {
     var count = 0;
     while (stack.length > 0 && paths.length < MAX_PATHS && count < CHUNK) {
       count++;
@@ -337,6 +343,12 @@ function _fakeSimDiscoverPathsAsync(onProgress, onDone) {
       _fakeSimPostProcess(paths);
       onDone(paths);
     }
+    } catch (e) {
+      console.error('fake-sim DFS error:', e);
+      // Entrega o que foi coletado até o ponto da falha para não travar o modal
+      _fakeSimPostProcess(paths);
+      onDone(paths);
+    }
   }
 
   setTimeout(tick, 0);
@@ -477,6 +489,9 @@ function _fakeSimGenerateVarsForPath(path) {
       var m88 = cleanU.match(/^([A-Z][A-Z0-9-]*)$/);
       if (m88) {
         var def88 = _simVarDefs.find(function (d) { return d.is88 && d.name === m88[1]; });
+        // Fallback: tenta _sim88Defs (cobre COPYs não expandidos e parseCobol)
+        if (!def88 && _sim88Defs && _sim88Defs[m88[1]])
+          def88 = { is88: true, name: m88[1], parentName: _sim88Defs[m88[1]].parent, values: _sim88Defs[m88[1]].values };
         if (def88 && def88.parentName) {
           if (wantTrue) {
             vars[def88.parentName] = def88.values[0] || 'S';
@@ -591,6 +606,9 @@ function _fakeSimGenerateVarsForPath(path) {
           var negated88 = /^NOT\s+/.test(when88Raw);
           var when88Name = negated88 ? when88Raw.replace(/^NOT\s+/, '') : when88Raw;
           var def88ev = _simVarDefs.find(function (d) { return d.is88 && d.name === when88Name; });
+          // Fallback: tenta _sim88Defs
+          if (!def88ev && _sim88Defs && _sim88Defs[when88Name])
+            def88ev = { is88: true, name: when88Name, parentName: _sim88Defs[when88Name].parent, values: _sim88Defs[when88Name].values };
           if (def88ev && def88ev.parentName) {
             if (!negated88) {
               vars[def88ev.parentName] = def88ev.values[0] || 'S';
@@ -835,12 +853,100 @@ function _fakeSimRenderPathList() {
   if (list.firstChild) list.firstChild.click();
 }
 
+// ── Validação pré-execução ────────────────────────────────────────
+// Retorna HTML com avisos/erros sobre o que não funcionará ao executar este caminho.
+function _fakeSimBuildWarnings(path) {
+  var items = [];
+
+  // 1) Limite de caminhos atingido
+  if (_fakeSimPaths && _fakeSimPaths.length >= 150) {
+    items.push({ level: 'info', msg: 'Limite de <b>150 caminhos</b> atingido — programas maiores podem ter caminhos não explorados.' });
+  }
+
+  // 2) Caminho truncado por profundidade
+  if (path.meta.truncated) {
+    items.push({ level: 'warn', msg: 'Caminho <b>truncado</b> — o fluxo é muito profundo. A geração de massa pode estar incompleta.' });
+  }
+
+  // 3) Arquivos sem layout
+  var allFdNames = (path.meta.openedFiles || []).concat(path.meta.readFiles || []).concat(path.meta.writtenFiles || []);
+  var seenFd = {};
+  allFdNames.forEach(function (fdName) {
+    if (seenFd[fdName]) return;
+    seenFd[fdName] = true;
+    var mode = _fsFdMode(fdName, path);
+    if (!mode || mode === 'output') return; // arquivos de saída começam vazios — normal
+    var fd = _simFiles[fdName];
+    if (!fd) {
+      items.push({ level: 'error', msg: 'Arquivo <b>' + _fsEsc(fdName) + '</b> não encontrado — verifique se o FD foi lido corretamente (o COPY pode estar fora do escopo).' });
+      return;
+    }
+    var effectiveFields = (fd.bookId && typeof _simGetBookFields === 'function')
+      ? (_simGetBookFields(fd.bookId) || fd.fields)
+      : fd.fields;
+    if (effectiveFields.length === 0) {
+      items.push({ level: 'warn', msg: 'Arquivo <b>' + _fsEsc(fdName) + '</b> sem layout — nenhum campo identificado no FILE SECTION. Vincule um <b>Book</b> para gerar registros reais.' });
+    }
+  });
+
+  // 4) Tabelas DB2 sem colunas
+  if (path.meta.sqlOps.length) {
+    Object.keys(_simDb2Tables || {}).forEach(function (tblName) {
+      var tbl = _simDb2Tables[tblName];
+      if (!tbl) return;
+      var isUsed = path.meta.sqlOps.some(function (op) { return op.toUpperCase().indexOf(tblName) >= 0; });
+      if (!isUsed) return;
+      // Tenta os mesmos fallbacks do _fakeSimInjectData
+      var hasCols = tbl.columns.length > 0;
+      if (!hasCols && tbl.selectMaps && tbl.selectMaps.length && tbl.selectMaps[0].into.length) hasCols = true;
+      if (!hasCols && tbl.whereMaps && tbl.whereMaps.length) hasCols = true;
+      if (!hasCols) {
+        items.push({ level: 'warn', msg: 'Tabela DB2 <b>' + _fsEsc(tblName) + '</b> sem colunas — use <code>SELECT COL1, COL2</code> (não <code>SELECT *</code>) ou importe o DDL/copybook de layout.' });
+      }
+    });
+  }
+
+  // 5) Condições 88 não resolvidas
+  var unresolved = [];
+  path.branches.forEach(function (b) {
+    if (b.tipo !== 'if') return;
+    var condU = (b.condition || '').replace(/^IF\s+/i, '').toUpperCase().trim();
+    var m88 = condU.match(/^(?:NOT\s+)?([A-Z][A-Z0-9-]*)$/);
+    if (!m88) return;
+    var name = m88[1];
+    var found = _simVarDefs.find(function (d) { return d.is88 && d.name === name; });
+    if (!found && _sim88Defs && _sim88Defs[name]) found = true;
+    if (!found) {
+      var isKnown = _simVarDefs.find(function (d) { return d.name === name && !d.isGroup; });
+      if (!isKnown && unresolved.indexOf(name) < 0) unresolved.push(name);
+    }
+  });
+  if (unresolved.length) {
+    items.push({ level: 'warn', msg: 'Condição(ões) não encontradas como nível 88 nem campo: <b>' + unresolved.map(_fsEsc).join(', ') + '</b> — verifique se o COPY foi expandido.' });
+  }
+
+  if (!items.length) return '';
+
+  var icons = { error: '🔴', warn: '🟡', info: '🔵' };
+  var html = '<div class="fs-warnings-panel">';
+  items.forEach(function (it) {
+    html += '<div class="fs-warn-item fs-warn-' + it.level + '">'
+      + '<span class="fs-warn-icon">' + (icons[it.level] || '⚠') + '</span>'
+      + '<span>' + it.msg + '</span></div>';
+  });
+  html += '</div>';
+  return html;
+}
+
 // ── Painel direito: detalhe completo ─────────────────────────────
 function _fakeSimRenderDetail(path) {
   var preview = document.getElementById('fake-sim-vars-preview');
   if (!preview) return;
 
   var vars = _fakeSimGenerateVarsForPath(path);
+  // Mantém _fakeSimGeneratedVars sincronizado para que _fakeSimRenderDataPreview
+  // consiga aplicar o patch do WHERE com os valores do caminho atual
+  _fakeSimGeneratedVars = vars;
 
   // Quais variáveis são chave (determinam os desvios)?
   var keyNames = new Set();
@@ -852,6 +958,9 @@ function _fakeSimRenderDetail(path) {
     var m88 = condU.match(/^(?:NOT\s+)?([A-Z][A-Z0-9-]*)$/);
     if (m88) {
       var def88 = _simVarDefs.find(function (d) { return d.is88 && d.name === m88[1]; });
+      // Fallback: tenta _sim88Defs
+      if (!def88 && _sim88Defs && _sim88Defs[m88[1]])
+        def88 = { parentName: _sim88Defs[m88[1]].parent };
       if (def88 && def88.parentName) keyNames.add(def88.parentName);
     }
   });
@@ -907,8 +1016,11 @@ function _fakeSimRenderDetail(path) {
         }).join('')
       + '</tbody></table>';
 
+  var warningsHtml = _fakeSimBuildWarnings(path);
+
   preview.innerHTML =
-    '<div class="fake-sim-story">' + _fakeSimBuildStory(path) + '</div>'
+    (warningsHtml || '')
+    + '<div class="fake-sim-story">' + _fakeSimBuildStory(path) + '</div>'
     + '<div class="fake-sim-vars-title"><span>🔑 = variável que determina o desvio&nbsp;&nbsp;✏ = alterada pelo caminho</span></div>'
     + tableHtml
     + (cobolCode
@@ -1130,7 +1242,11 @@ function _fakeSimInjectData(path) {
     }
 
     // INPUT, I-O, EXTEND: arquivo pré-existente — precisa de registros carregados
-    if (fd.fields.length === 0) return; // sem layout conhecido
+    // Usa book fields quando fd.fields está vazio mas um book foi vinculado
+    var effectiveFields = (fd.bookId && typeof _simGetBookFields === 'function')
+      ? (_simGetBookFields(fd.bookId) || fd.fields)
+      : fd.fields;
+    if (effectiveFields.length === 0) return; // sem layout conhecido
 
     // EOF → 3 registros (loop consome todos e chega ao fim)
     var qty = isEofPath ? 3 : 2;
@@ -1647,7 +1763,17 @@ function _fakeSimWriteDoc(paths, allMode) {
     path.branches.forEach(function (b) {
       var cu = (b.condition || '').replace(/^IF\s+/i,'').replace(/^EVALUATE\s+/i,'').toUpperCase();
       var mo = cu.match(/^(?:NOT\s+)?([A-Z][A-Z0-9-]*)/);
-      if (mo) keyNms.add(mo[1]);
+      if (mo) {
+        keyNms.add(mo[1]);
+        // Nível 88: adiciona o PAI como variável chave
+        var m88k = cu.match(/^(?:NOT\s+)?([A-Z][A-Z0-9-]*)$/);
+        if (m88k) {
+          var def88k = _simVarDefs.find(function(d){ return d.is88 && d.name === m88k[1]; });
+          if (!def88k && _sim88Defs && _sim88Defs[m88k[1]])
+            def88k = { parentName: _sim88Defs[m88k[1]].parent };
+          if (def88k && def88k.parentName) keyNms.add(def88k.parentName);
+        }
+      }
     });
     Object.values(_simFileStatusMap || {}).forEach(function (sv) { if (sv) keyNms.add(sv); });
 

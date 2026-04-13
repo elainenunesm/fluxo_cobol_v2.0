@@ -65,7 +65,16 @@ function _parseWsVars(code) {
     if (rl.length >= 7) {
       var c7 = rl[6];
       if (/^[\d ]{6}/.test(rl) || (/^[A-Za-z0-9 ]{6}/.test(rl) && (c7 === ' ' || c7 === '*' || c7 === '/'))) {
-        norm = rl.slice(6);
+        var _stripped = rl.slice(6);
+        // Se o strip removeria um número de nível (ex.: "    88 VAR" ou "    77 VAR"),
+        // preserva o original para não perder a declaração de nível.
+        var _luOrig  = rl.trim().toUpperCase();
+        var _luStrip = _stripped.trim().toUpperCase();
+        if (/^\d{1,2}\s+[A-Z@#$]/.test(_luOrig) && !/^\d{1,2}\s+[A-Z@#$]/.test(_luStrip)) {
+          norm = rl;
+        } else {
+          norm = _stripped;
+        }
       }
     }
     var lt = norm.trim();
@@ -3458,16 +3467,25 @@ function _simAdvance() {
           var _dbgFull = (_dbgVarM[1] + (_dbgVarM[2] ? _dbgVarM[2].replace(/\s+/g,'') : '')).trim();
           var _dbgRef  = _simGetVarVal(_dbgFull);
           var _dbgHas  = _dbgRef.found;
-          var _dbgVal  = _dbgHas ? _dbgRef.value : '(NÃO ESTÁ EM _simVars)';
-          _simLog('🔍 DEBUG IF: ' + _dbgFull + ' = ' + JSON.stringify(_dbgVal) + (_dbgHas ? '' : ' ← variável não foi inicializada!'), 'sim-log-branch');
-          // Se não está em _simVars mas deveria ser FILE STATUS, mostra dica
-          if (!_dbgHas) {
-            var _dbgVn    = _dbgVarM[1]; // nome base sem subscript para busca no mapa
-            var _dbgFsVars = Object.values(_simFileStatusMapDebug);
-            if (_dbgFsVars.indexOf(_dbgVn) >= 0) {
-              _simLog('🔍 DEBUG: ' + _dbgVn + ' é FILE STATUS de ' + Object.keys(_simFileStatusMapDebug).find(function(k){return _simFileStatusMapDebug[k]===_dbgVn;}) + ' — mas o OPEN ainda não rodou ou parser falhou', 'sim-log-error');
-            } else if (Object.keys(_simFileStatusMapDebug).length === 0) {
-              _simLog('🔍 DEBUG: FILE STATUS MAP vazio — SELECT...FILE STATUS IS não foi reconhecido no código', 'sim-log-error');
+          // Verifica se a condição é um nome de nível 88 (condition-name)
+          if (!_dbgHas && _sim88Defs.hasOwnProperty(_dbgFull)) {
+            var _d88dbg  = _sim88Defs[_dbgFull];
+            var _p88Ref  = _simGetVarVal(_d88dbg.parent);
+            _simLog('🔍 DEBUG IF: ' + _dbgFull + ' (nível 88 — pai: ' + _d88dbg.parent
+              + ' = ' + JSON.stringify(_p88Ref.found ? _p88Ref.value : '?')
+              + ', check: ' + _d88dbg.values.join('|') + ')', 'sim-log-branch');
+          } else {
+            var _dbgVal = _dbgHas ? _dbgRef.value : '(NÃO ESTÁ EM _simVars)';
+            _simLog('🔍 DEBUG IF: ' + _dbgFull + ' = ' + JSON.stringify(_dbgVal) + (_dbgHas ? '' : ' ← variável não foi inicializada!'), 'sim-log-branch');
+            // Se não está em _simVars mas deveria ser FILE STATUS, mostra dica
+            if (!_dbgHas) {
+              var _dbgVn    = _dbgVarM[1]; // nome base sem subscript para busca no mapa
+              var _dbgFsVars = Object.values(_simFileStatusMapDebug);
+              if (_dbgFsVars.indexOf(_dbgVn) >= 0) {
+                _simLog('🔍 DEBUG: ' + _dbgVn + ' é FILE STATUS de ' + Object.keys(_simFileStatusMapDebug).find(function(k){return _simFileStatusMapDebug[k]===_dbgVn;}) + ' — mas o OPEN ainda não rodou ou parser falhou', 'sim-log-error');
+              } else if (Object.keys(_simFileStatusMapDebug).length === 0) {
+                _simLog('🔍 DEBUG: FILE STATUS MAP vazio — SELECT...FILE STATUS IS não foi reconhecido no código', 'sim-log-error');
+              }
             }
           }
         }
