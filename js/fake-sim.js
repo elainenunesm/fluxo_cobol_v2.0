@@ -987,6 +987,24 @@ function _fsGenFakeValue(fieldName, idx, fdName) {
     vdefPic = _simVarDefs.find(function(d){ return d.name === fieldName && !d.isGroup; });
   }
 
+  // FILLER: usa VALUE definido no COBOL em vez de valor fictício.
+  // FILLER não pode ser referenciado por nome — usar seu VALUE definido é mais fiel ao programa real.
+  // Se não há definição encontrada (ex: arquivo via book sem entry no FILE SECTION), retorna ''
+  // (espaços, que é o valor mais comum para padding FILLER).
+  if (fieldName === 'FILLER') {
+    if (vdefPic) {
+      var _fv = (vdefPic.value !== null && vdefPic.value !== undefined) ? String(vdefPic.value) : '';
+      var _fl = vdefPic.len || 1;
+      if (vdefPic.picType === '9') {
+        _fv = _fv.replace(/\D/g, '') || '0';
+        while (_fv.length < _fl) _fv = '0' + _fv;
+        return _fv.slice(-_fl);
+      }
+      return (_fv + ' '.repeat(_fl)).slice(0, _fl).trimEnd();
+    }
+    return ''; // sem definição PIC → espaço (padding)
+  }
+
   // Aplica o comprimento do PIC ao valor escolhido
   function _applyPic(raw) {
     if (!vdefPic) return raw;

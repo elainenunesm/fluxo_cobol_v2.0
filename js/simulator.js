@@ -183,10 +183,12 @@ function _parseWsVars(code) {
     } else {
       defVal = '';
     }
+    var _redefM = rest.match(/\bREDEFINES\s+([A-Z][A-Z0-9-]*)\b/i);
     result.push({ level: level, name: name, pic: pic, picType: picType, len: len,
                   value: defVal !== null ? defVal : '', isGroup: isGroup, section: currentSection,
-                  fdName:   (currentSection === 'FILE' ? lastFdName  : ''),
-                  isSdFile: (currentSection === 'FILE' ? lastFdIsSD  : false) });
+                  fdName:        (currentSection === 'FILE' ? lastFdName  : ''),
+                  isSdFile:      (currentSection === 'FILE' ? lastFdIsSD  : false),
+                  redefinesName: _redefM ? _redefM[1].toUpperCase() : '' });
     // OCCURS N [TIMES]: marca occursN na entrada recém adicionada
     var _occM = rest.match(/\bOCCURS\s+(\d+)\b/i);
     if (_occM) {
@@ -234,6 +236,16 @@ function _parseWsVars(code) {
         _activeOccurs.push({ level: v.level, occursN: _parentOcc.occursN, name: v.name });
       }
     }
+  });
+
+  // ── Rastreia grupo pai direto de cada campo ──────────────────────────────
+  // Usado em _simInitVars para propagar VALUES de FILLER para campos OCCURS em REDEFINES.
+  var _pgStk = [];
+  result.forEach(function(v) {
+    if (v.isIndex) return;
+    while (_pgStk.length && _pgStk[_pgStk.length - 1].level >= v.level) _pgStk.pop();
+    if (_pgStk.length) v.parentGroup = _pgStk[_pgStk.length - 1].name;
+    if (v.isGroup) _pgStk.push({ level: v.level, name: v.name });
   });
 
   return result;
@@ -312,6 +324,77 @@ function _simInitVars(code) {
       }
     }
   });
+
+  // ── Propaga VALUES de FILLERs para campos OCCURS em grupos com REDEFINES ──────────
+  // Padrão comum: 01 TB-INIT. 05 FILLER PIC X(3) VALUE 'AAA'. ...
+  //               01 TB REDEFINES TB-INIT. 05 EL OCCURS 3 PIC X(3).
+  // Sem esta propagação, EL(1..3) inicializaria com '' (default PIC X).
+  (function () {
+    var grpMap = {};     // groupName → { children: [], redefinesName: '' }
+    var pgStack = [];
+    _simVarDefs.forEach(function (v) {
+      if (v.isIndex) return;
+      while (pgStack.length && pgStack[pgStack.length - 1].level >= v.level) pgStack.pop();
+      var parentName = pgStack.length ? pgStack[pgStack.length - 1].name : '';
+      if (v.isGroup) {
+        if (!grpMap[v.name]) grpMap[v.name] = { children: [], redefinesName: v.redefinesName || '' };
+        else if (v.redefinesName) grpMap[v.name].redefinesName = v.redefinesName;
+        pgStack.push({ level: v.level, name: v.name });
+      } else if (!v.is88 && parentName) {
+        if (!grpMap[parentName]) grpMap[parentName] = { children: [], redefinesName: '' };
+        grpMap[parentName].children.push(v);
+      }
+    });
+    Object.keys(grpMap).forEach(function (gName) {
+      var grp = grpMap[gName];
+      if (!grp.redefinesName) return;
+      var srcGrp = grpMap[grp.redefinesName];
+      if (!srcGrp || !srcGrp.children.length) return;
+      // Processa apenas quando a fonte for plana (sem subgrupos) para evitar erros de offset
+      if (!srcGrp.children.every(function (c) { return !c.isGroup; })) return;
+      // Monta string de bytes da fonte a partir dos VALUES dos filhos
+      var srcStr = '';
+      srcGrp.children.forEach(function (c) {
+        var len = c.len || 1;
+        var val = (c.value !== null && c.value !== undefined) ? String(c.value) : '';
+        if (c.picType === '9') {
+          val = val.replace(/\D/g, '') || '0';
+          while (val.length < len) val = '0' + val;
+          val = val.slice(-len);
+        } else {
+          val = (val + ' '.repeat(len)).slice(0, len);
+        }
+        srcStr += val;
+      });
+      // Não faz nada se a fonte for toda espaços/zeros (nenhum VALUE real definido)
+      if (!srcStr.replace(/[\s0]/g, '').length) return;
+      // Inicializa campos do grupo REDEFINES por posição de byte
+      var offset = 0;
+      grp.children.forEach(function (c) {
+        if (c.is88 || c.isIndex || c.isGroup) return;
+        var len = c.len || 1;
+        if (c.occursN) {
+          for (var oi = 1; oi <= c.occursN; oi++) {
+            var sl = srcStr.slice(offset + (oi - 1) * len, offset + oi * len);
+            if (!sl) return;
+            var slV = c.picType === '9' ? (sl.trimStart() || '0') : sl.trimEnd();
+            _simVars[c.name + '(' + oi + ')'] = slV;
+            _simVarsInitial[c.name + '(' + oi + ')'] = slV;
+          }
+          offset += len * c.occursN;
+        } else {
+          var sl2 = srcStr.slice(offset, offset + len);
+          if (sl2) {
+            var sl2V = c.picType === '9' ? (sl2.trimStart() || '0') : sl2.trimEnd();
+            _simVars[c.name]        = sl2V;
+            _simVarsInitial[c.name] = sl2V;
+          }
+          offset += len;
+        }
+      });
+    });
+  })();
+
   _simInitFiles();
   // Garante que TODAS as variáveis FILE STATUS IS existam em _simVars,
   // mesmo que não tenham sido declaradas no WORKING-STORAGE
@@ -1196,9 +1279,23 @@ function _parseDb2Cursors(code, tables) {
     if (fetchM) {
       var fcName = fetchM[1];
       var intoV  = fetchM[2].split(',').map(function(v){ return v.trim().replace(/^:/,''); }).filter(Boolean);
-      if (cursors[fcName]) cursors[fcName].intoVars = intoV;
-      // fallback: cria entrada rasa se ainda não existe
-      else cursors[fcName] = { tableName: '', cols: [], pointer: 0, isOpen: false, intoVars: intoV };
+      if (cursors[fcName]) {
+        cursors[fcName].intoVars = intoV;
+        // Quando SELECT * (sem colunas explícitas), propaga as INTO vars como colunas da tabela.
+        // Isso garante que _fakeSimInjectData gere linhas com as colunas corretas,
+        // e que o FETCH runtime localize os valores pelo nome da coluna.
+        var _fcTbl = cursors[fcName].tableName;
+        if (_fcTbl && tables[_fcTbl] && intoV.length && !tables[_fcTbl].columns.length) {
+          tables[_fcTbl].columns = intoV.slice();
+          var _smOk = tables[_fcTbl].selectMaps.some(function(sm) {
+            return sm.into.join(',') === intoV.join(',');
+          });
+          if (!_smOk) tables[_fcTbl].selectMaps.push({ cols: [], into: intoV });
+        }
+      } else {
+        // fallback: cria entrada rasa se ainda não existe
+        cursors[fcName] = { tableName: '', cols: [], pointer: 0, isOpen: false, intoVars: intoV };
+      }
     }
   });
   return cursors;
