@@ -1963,9 +1963,9 @@ function _simEvalSimpleCond(text) {
     else return null;
     return notFlag ? !ok : ok;
   }
-  // Suporte a parênteses externos: (WS-A = 1) → WS-A = 1
+  // Suporte a parênteses externos: (WS-A = 1) ou (COND1 OR COND2) → avalia conteúdo
   if (text.charAt(0) === '(' && text.charAt(text.length - 1) === ')') {
-    return _simEvalSimpleCond(text.slice(1, -1).trim());
+    return _simEvalCond(text.slice(1, -1).trim());
   }
   // Condição nível 88: IF FLAG-ATIVO → verifica se pai = valor do 88
   if (/^[A-Z][A-Z0-9-]*$/.test(text)) {
@@ -3075,6 +3075,11 @@ function _simStopExecute(close, keepState) {
       _simVarsMoved  = {};
       _simVarsChanged = {};
       _simResetFilePointers();
+      // Reseta cursores (ponteiro e isOpen) sem apagar a declaração
+      Object.keys(_simDb2Cursors).forEach(function(cn) {
+        _simDb2Cursors[cn].isOpen  = false;
+        _simDb2Cursors[cn].pointer = 0;
+      });
       // Separador no log do simulador
       _simLog('── Reiniciado (continuação) ──', 'sim-log-restart-sep');
       // Separador no log do Mapa de Execução
@@ -3093,6 +3098,16 @@ function _simStopExecute(close, keepState) {
       if (emLog) emLog.innerHTML = '';
       // Restaura variáveis ao valor inicial do usuário
       _simVarDefs.forEach(function(v) { if (!v.isGroup) _simVars[v.name] = _simVarsInitial.hasOwnProperty(v.name) ? _simVarsInitial[v.name] : v.value; });
+      // Restaura tabelas DB2 ao estado do ▶ (desfaz DELETEs feitos durante a simulação)
+      if (_simDb2TablesInitial && Object.keys(_simDb2TablesInitial).length > 0) {
+        _simDb2Tables = JSON.parse(JSON.stringify(_simDb2TablesInitial));
+        // Fecha todos os cursores (mantém declaração, reseta ponteiro)
+        Object.keys(_simDb2Cursors).forEach(function(cn) {
+          _simDb2Cursors[cn].isOpen  = false;
+          _simDb2Cursors[cn].pointer = 0;
+        });
+        _simRefreshDb2Panel();
+      }
     }
     var vp2 = document.getElementById('sim-vars-panel');
     if (vp2) { _simRefreshVarsPanel(); vp2.classList.add('sim-vars-visible'); }
@@ -3570,7 +3585,10 @@ function _simAdvance() {
         evalResult = _simLastReadAtEnd;
       } else {
         // DEBUG: extrai nome (+ subscript opcional) da condição para mostrar valor atual
-        var _dbgVarM = condNorm.replace(/^(?:IF|WHEN)\s+/,'').match(/^([A-Z][A-Z0-9-]*)(\s*\([^)]+\))?/);
+        // Remove prefixo IF/WHEN e NOT antes de extrair o nome da variável/88
+        var _dbgCondBase = condNorm.replace(/^(?:IF|WHEN)\s+/,'').replace(/^NOT\s+/,'');
+        var _dbgIsNot    = /^NOT\s+/.test(condNorm.replace(/^(?:IF|WHEN)\s+/,''));
+        var _dbgVarM = _dbgCondBase.match(/^([A-Z][A-Z0-9-]*)(\s*\([^)]+\))?/);
         if (_dbgVarM) {
           var _dbgFull = (_dbgVarM[1] + (_dbgVarM[2] ? _dbgVarM[2].replace(/\s+/g,'') : '')).trim();
           var _dbgRef  = _simGetVarVal(_dbgFull);
@@ -3579,12 +3597,12 @@ function _simAdvance() {
           if (!_dbgHas && _sim88Defs.hasOwnProperty(_dbgFull)) {
             var _d88dbg  = _sim88Defs[_dbgFull];
             var _p88Ref  = _simGetVarVal(_d88dbg.parent);
-            _simLog('🔍 DEBUG IF: ' + _dbgFull + ' (nível 88 — pai: ' + _d88dbg.parent
+            _simLog('🔍 DEBUG IF: ' + (_dbgIsNot ? 'NOT ' : '') + _dbgFull + ' (nível 88 — pai: ' + _d88dbg.parent
               + ' = ' + JSON.stringify(_p88Ref.found ? _p88Ref.value : '?')
               + ', check: ' + _d88dbg.values.join('|') + ')', 'sim-log-branch');
           } else {
             var _dbgVal = _dbgHas ? _dbgRef.value : '(NÃO ESTÁ EM _simVars)';
-            _simLog('🔍 DEBUG IF: ' + _dbgFull + ' = ' + JSON.stringify(_dbgVal) + (_dbgHas ? '' : ' ← variável não foi inicializada!'), 'sim-log-branch');
+            _simLog('🔍 DEBUG IF: ' + (_dbgIsNot ? 'NOT ' : '') + _dbgFull + ' = ' + JSON.stringify(_dbgVal) + (_dbgHas ? '' : ' ← variável não foi inicializada!'), 'sim-log-branch');
             // Se não está em _simVars mas deveria ser FILE STATUS, mostra dica
             if (!_dbgHas) {
               var _dbgVn    = _dbgVarM[1]; // nome base sem subscript para busca no mapa
