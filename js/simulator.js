@@ -1622,57 +1622,57 @@ function _simDoWrite(labelU, isRewrite) {
   fd.isOutput = true;
   // ── FROM ws-var: copia campos da WS para os campos do FD ─────
   // WRITE ARQ-SAIDA FROM WS-REG → equivale a MOVE WS-REG TO ARQ-SAIDA antes do WRITE.
-  // Estratégia: se _fromVar é um grupo, pega todos os vars da WS cujo fdName não seja
-  // definido ou cujo pai (group) tenha esse nome — e mapeia pelos campos do FD em ordem.
+  // Estratégia: monta a "string bruta" da origem (group move semântico COBOL):
+  //   - Se _fromVar é grupo: concatena todos os filhos folha (padding por len)
+  //   - Se _fromVar é elementar: usa o valor diretamente
+  // Depois distribui a string bruta pelos campos do FD por offset/tamanho.
   if (_fromVar) {
-    // 1) Tenta mapear por nome: campos do FD que existam com o mesmo nome na WS
-    var _fdFields = _simGetActiveFields ? _simGetActiveFields(fdName) : (fd.fields || []);
-    var _mappedAny = false;
-    _fdFields.forEach(function(fld) {
-      if (_simVars.hasOwnProperty(fld)) return; // já sincronizado
-      // Procura campo equivalente na WS (ex: FD tem CAMPO-X, WS tem CAMPO-X também)
-      // Isso acontece quando as áreas são REDEFINES ou compartilham nomes
-    });
-    // 2) Tenta copiar a partir do grupo WS: filhos diretos do grupo _fromVar em _simVarDefs
-    var _wsGroupChildren = [];
-    var _inGroup = false;
-    _simVarDefs.forEach(function(v) {
-      if (v.name === _fromVar && v.isGroup) { _inGroup = true; return; }
-      if (_inGroup) {
-        if (v.level <= (_simVarDefs.find(function(d){ return d.name === _fromVar; }) || {}).level) {
-          _inGroup = false; return;
-        }
-        if (!v.isGroup && !v.is88) _wsGroupChildren.push(v.name);
-      }
-    });
-    if (_wsGroupChildren.length > 0) {
-      // Mapeia na ordem: campos do FD ↔ campos do grupo WS (posicionalmente)
-      var _fdF2 = fd.fields.length ? fd.fields : _fdFields;
-      _fdF2.forEach(function(fld, idx) {
-        var src = _wsGroupChildren[idx];
-        if (src && _simVars.hasOwnProperty(src)) {
-          _simSetVarInternal(fld, _simVars[src]);
+    var _fromEntry = null;
+    for (var _fi = 0; _fi < _simVarDefs.length; _fi++) {
+      if (_simVarDefs[_fi].name === _fromVar) { _fromEntry = _simVarDefs[_fi]; break; }
+    }
+    var _rawStr = null;
+    if (_fromEntry && _fromEntry.isGroup) {
+      // Constrói string bruta concatenando todos os filhos folha em ordem
+      var _fromLevel = _fromEntry.level;
+      var _inFromGroup = false;
+      _rawStr = '';
+      _simVarDefs.forEach(function(v) {
+        if (v === _fromEntry && !_inFromGroup) { _inFromGroup = true; return; }
+        if (_inFromGroup) {
+          if (v.level <= _fromLevel) { _inFromGroup = false; return; }
+          if (!v.isGroup && !v.is88) {
+            var _len = v.len || 1;
+            var _val = _simVars.hasOwnProperty(v.name) ? String(_simVars[v.name]) : '';
+            if (v.picType === '9') {
+              _val = _val.replace(/\D/g, '') || '0';
+              while (_val.length < _len) _val = '0' + _val;
+              _val = _val.slice(-_len);
+            } else {
+              _val = (_val + ' '.repeat(_len)).slice(0, _len);
+            }
+            _rawStr += _val;
+          }
         }
       });
-      _simLog('  ↳ FROM ' + _fromVar + ' → ' + _wsGroupChildren.length + ' campo(s) copiado(s) para ' + fdName, 'sim-log-file-var');
-      _mappedAny = true;
+    } else if (_simVars.hasOwnProperty(_fromVar)) {
+      _rawStr = String(_simVars[_fromVar]);
     }
-    if (!_mappedAny) {
-      // Fallback: _fromVar é uma variável elementar (área de trabalho do mesmo tamanho)
-      // Tenta distribuir o valor bruto da string pelos campos do FD por offset/tamanho
-      var _rawVal = _simVars[_fromVar] !== undefined ? String(_simVars[_fromVar]) : null;
-      if (_rawVal !== null) {
-        var _fdFld3 = fd.fields.length ? fd.fields : _fdFields;
-        var _off = 0;
-        _fdFld3.forEach(function(fld) {
-          var _meta = _simVarDefs.find(function(d){ return d.name === fld && !d.isGroup; });
-          var _len  = _meta ? (_meta.len || 1) : 1;
-          var _slice = _rawVal.substring(_off, _off + _len);
-          _simSetVarInternal(fld, _slice);
-          _off += _len;
-        });
-        _simLog('  ↳ FROM ' + _fromVar + ' (elementar) → distribuído por offset nos campos de ' + fdName, 'sim-log-file-var');
-      }
+    if (_rawStr !== null && _rawStr !== '') {
+      // Distribui a string bruta pelos campos do FD por offset/tamanho
+      var _fdFlds = _simGetActiveFields(fdName);
+      var _off = 0;
+      _fdFlds.forEach(function(fld) {
+        var _meta = null;
+        for (var _mi = 0; _mi < _simVarDefs.length; _mi++) {
+          if (_simVarDefs[_mi].name === fld && !_simVarDefs[_mi].isGroup) { _meta = _simVarDefs[_mi]; break; }
+        }
+        var _len   = _meta ? (_meta.len || 1) : 1;
+        var _slice = _rawStr.substring(_off, _off + _len);
+        _simSetVarInternal(fld, _slice);
+        _off += _len;
+      });
+      _simLog('  ↳ FROM ' + _fromVar + ' → ' + _fdFlds.length + ' campo(s) de ' + fdName, 'sim-log-file-var');
     }
   }
   // Captura snapshot dos valores atuais dos campos do FD
