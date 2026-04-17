@@ -3558,6 +3558,70 @@ ${sheets}</Workbook>`;
 }
 
 // ================================================================
+// EXPORTAR LAYOUT — WORD (.doc)
+// ================================================================
+function bkExportWord() {
+  _bkPickBook('Exportar Layout Word', books => {
+    const esc = s => String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+    books.forEach(book => {
+      let tableRows = '';
+      _bkExportSections(book).forEach(sec => {
+        if (sec.label) {
+          tableRows += `<tr><td colspan="8" style="background:#E8EAF6;font-weight:bold;color:#1A237E;font-size:11pt;padding:6px 8px;">${esc(book.name)} \u2014 ${esc(sec.label)}</td></tr>`;
+        }
+        sec.fields.forEach((f, i) => {
+          tableRows += `<tr style="background:${i % 2 === 0 ? '#ffffff' : '#f5f7ff'}">
+            <td>${esc(f.level)}</td>
+            <td>${esc(f.name)}</td>
+            <td>${esc(f.pic || '')}</td>
+            <td>${esc(f.type)}</td>
+            <td style="text-align:right;">${f.offset + 1}</td>
+            <td style="text-align:right;">${esc(f.size || '')}</td>
+            <td style="text-align:right;">${f.offset + f.size}</td>
+            <td>${esc(f.redefines || '')}</td>
+          </tr>`;
+        });
+      });
+
+      const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office"
+  xmlns:w="urn:schemas-microsoft-com:office:word"
+  xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta charset="UTF-8">
+<title>${esc(book.name)} \u2014 Layout</title>
+<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom>
+<w:DoNotOptimizeForBrowser/></w:WordDocument></xml><![endif]-->
+<style>
+  body { font-family: Calibri, Arial, sans-serif; font-size: 10pt; margin: 2cm; }
+  h1 { font-size: 16pt; color: #1A237E; border-bottom: 2px solid #1A237E; padding-bottom: 4px; margin-bottom: 12px; }
+  p.meta { font-size: 9pt; color: #555; margin: 0 0 16px 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 9pt; }
+  th { background: #1A237E; color: #ffffff; font-weight: bold; padding: 5px 8px;
+       border: 1px solid #777; text-align: left; white-space: nowrap; }
+  td { padding: 4px 8px; border: 1px solid #cccccc; vertical-align: top; }
+</style>
+</head>
+<body>
+<h1>Layout: ${esc(book.name)}</h1>
+<p class="meta">Gerado em ${new Date().toLocaleString('pt-BR')} &mdash; COBOL Flow</p>
+<table>
+  <tr>
+    <th>N&iacute;vel</th><th>Nome</th><th>PIC</th><th>Tipo</th>
+    <th>In&iacute;cio</th><th>Tam</th><th>Fim</th><th>REDEFINES</th>
+  </tr>
+  ${tableRows}
+</table>
+</body>
+</html>`;
+
+      bkDownloadBlob(html, `${book.name}-layout.doc`, 'application/msword;charset=utf-8');
+    });
+  });
+}
+
+// ================================================================
 // SALVAR / CARREGAR SESSÃO COMPLETA
 // ================================================================
 function bkSaveSession() {
